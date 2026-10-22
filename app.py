@@ -19,27 +19,34 @@ HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Log Analyzer Pro</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#141c31; --muted:#9ba8c7; --text:#f2f5ff; --line:#293653; --blue:#6ea8fe; }
+    :root { color-scheme: dark; --bg:#080d1a; --panel:#111a2d; --muted:#a6b2cc; --text:#f4f7ff; --line:#293752; --blue:#76a9ff; }
     * { box-sizing:border-box; }
-    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
-    .wrap { max-width:1050px; margin:auto; padding:24px 16px 40px; }
-    header { display:flex; justify-content:space-between; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom:22px; }
-    h1 { margin:0; font-size:clamp(24px,5vw,34px); }
+    body { margin:0; background:radial-gradient(ellipse at top,#142342 0%,var(--bg) 48%); color:var(--text); font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif; }
+    .wrap { max-width:1120px; margin:auto; padding:26px 18px 44px; }
+    header { display:flex; justify-content:space-between; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+    h1 { margin:0; font-size:clamp(25px,5vw,36px); letter-spacing:-.7px; }
     .sub { color:var(--muted); margin:5px 0 0; }
-    .badge { background:#20345c; color:#b8d3ff; border:1px solid #35548b; padding:6px 10px; border-radius:999px; font-size:12px; }
+    .badge { background:#20345c; color:#c5dcff; border:1px solid #35548b; padding:7px 11px; border-radius:999px; font-size:12px; font-weight:700; }
+    .nav { display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 20px; }
+    .nav a { color:#c9d9ff; text-decoration:none; border:1px solid var(--line); border-radius:999px; padding:7px 12px; font-size:13px; }
+    .nav a:hover { background:#1c2b49; }
+    .hero { padding:24px; border:1px solid #344b75; border-radius:18px; background:linear-gradient(125deg,#172a4b,#111a2d 68%); box-shadow:0 16px 40px #0002; }
+    .hero h2 { font-size:clamp(21px,4vw,29px); margin:0 0 8px; letter-spacing:-.4px; }
+    .hero p { margin:0; max-width:720px; color:#c0cce3; }
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }
-    .card,.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; }
+    .card,.panel { background:linear-gradient(145deg,#141e34,var(--panel)); border:1px solid var(--line); border-radius:15px; padding:17px; box-shadow:0 8px 24px #00000012; }
     .label { color:var(--muted); font-size:13px; }
-    .num { font-size:28px; font-weight:750; margin-top:4px; overflow-wrap:anywhere; }
-    .panel { margin-top:14px; }
+    .num { font-size:29px; font-weight:800; margin-top:4px; overflow-wrap:anywhere; letter-spacing:-.5px; }
+    .panel { margin-top:15px; }
     h2 { font-size:18px; margin:0 0 12px; }
     form { margin:0; }
     .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
     input,select,button,.button { border:1px solid var(--line); border-radius:9px; padding:10px 12px; font:inherit; }
     input,select { background:#0c1427; color:var(--text); max-width:100%; }
     input[type=file] { width:100%; }
-    button,.button { background:#2d65c8; color:white; border:0; cursor:pointer; text-decoration:none; display:inline-block; }
-    button:hover,.button:hover { filter:brightness(1.12); }
+    button,.button { background:linear-gradient(135deg,#3478e5,#2458b8); color:white; border:0; cursor:pointer; text-decoration:none; display:inline-block; font-weight:650; box-shadow:0 5px 14px #1d4b9926; }
+    button:hover,.button:hover { filter:brightness(1.12); transform:translateY(-1px); }
+    input:focus,select:focus,button:focus,.button:focus { outline:2px solid var(--blue); outline-offset:2px; }
     .secondary { background:#34415b; }
     .notice { padding:11px 13px; border-radius:10px; margin:12px 0; background:#152d2a; border:1px solid #28685c; }
     .error-notice { background:#3a2029; border-color:#814052; }
@@ -59,8 +66,10 @@ HTML = r"""
 <div class="wrap">
   <header>
     <div><h1>📊 Log Analyzer Pro</h1><p class="sub">Upload, search, and summarize application logs.</p></div>
-    <span class="badge">FLASK • LEVEL 5 PROJECT</span>
+    <span class="badge">LOG ANALYSIS WORKSPACE</span>
   </header>
+  <nav class="nav" aria-label="Main navigation"><a href="/">Dashboard</a><a href="/about">About</a><a href="/contact">Contact</a><a href="/privacy">Privacy</a></nav>
+  <section class="hero"><h2>Understand your logs. Find issues faster.</h2><p>Upload a text log, spot errors and warnings, search important events, and export a clean report. Your analysis is designed to be simple on desktop and mobile.</p></section>
 
   {% if message %}<div class="notice {% if is_error %}error-notice{% endif %}">{{ message }}</div>{% endif %}
 
@@ -111,7 +120,7 @@ HTML = r"""
       <div class="empty">No log lines match these filters.</div>
     {% endif %}
   </section>
-  <div class="footer">Log Analyzer Pro • Built with Flask • Analyze only logs you are authorized to access.</div>
+  <div class="footer">Log Analyzer Pro • Clear insights from application logs • Analyze only logs you are authorized to access.<br><span><a href="/about" style="color:inherit">About</a> · <a href="/contact" style="color:inherit">Contact</a> · <a href="/privacy" style="color:inherit">Privacy</a></span></div>
 </div>
 </body>
 </html>
@@ -321,33 +330,4 @@ footer{margin-top:24px;padding-top:14px;border-top:1px solid #d8deea;font-size:1
 <h2>Summary</h2><p>The report reviewed {{ stats.total }} log lines, identifying {{ stats.errors }} error(s), {{ stats.warnings }} warning(s), and {{ stats.info_other }} informational or uncategorized line(s).</p>
 <h2>Log details</h2>
 <table><thead><tr><th style="width:7%">#</th><th style="width:12%">Level</th><th>Log message and guidance</th></tr></thead><tbody>
-{% for item in entries %}<tr><td>{{ item.number }}</td><td class="level {{ item.level }}">{{ item.level }}</td><td>{{ item.text }}{% if item.meaning %}<div class="explain"><strong>Possible meaning:</strong> {{ item.meaning }}<br><strong>Suggested check:</strong> {{ item.action }}</div>{% endif %}</td></tr>{% endfor %}
-</tbody></table>
-<footer>Generated by Log Analyzer Pro. Rule-based explanations are suggestions, not proof of root cause. Review surrounding logs and system context. Analyze only logs you are authorized to access; remove passwords, tokens, and personal data before sharing.</footer>
-</main></body></html>"""
-    return render_template_string(report_html, created=created, stats=stats, entries=entries)
-
-@app.route("/report.csv", methods=["GET"])
-def download_report():
-    lines, _ = analyze()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Line number", "Level", "Log message"])
-    for number, line in enumerate(lines, start=1):
-        kind = classify(line)
-        writer.writerow([number, kind.upper(), line.rstrip("\n")])
-    data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-    return send_file(
-        data,
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=f"log-analysis-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
-    )
-
-@app.errorhandler(413)
-def file_too_large(_error):
-    return "File too large. Please upload a file smaller than 2 MB.", 413
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+{% for item in entries %}<tr><
