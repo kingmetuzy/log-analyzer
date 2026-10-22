@@ -127,33 +127,54 @@ def classify(line):
     return "other"
 
 def explain_error(line):
-    """Give a cautious, rule-based hint for common log errors."""
+    """Give cautious, rule-based guidance for common log messages."""
     text = line.lower()
     rules = [
-        (("database", "db connection", "connection refused"),
+        (("database", "db connection", "connection refused", "could not connect"),
          "A service connection may have been refused or the database may be unavailable.",
          "Check the database service, host/port settings, network access, and credentials."),
-        (("timeout", "timed out"),
+        (("timeout", "timed out", "deadline exceeded"),
          "An operation took longer than the allowed time.",
          "Check service health, network latency, and timeout settings."),
-        (("permission denied", "access denied", "forbidden"),
+        (("dns", "name resolution", "could not resolve host", "getaddrinfo failed"),
+         "The application may be unable to resolve a server name to an address.",
+         "Check the hostname, DNS settings, and network connection."),
+        (("connection reset", "connection aborted", "broken pipe", "network is unreachable", "no route to host"),
+         "A network connection may have been interrupted or the destination may be unreachable.",
+         "Check network access, the destination service, firewall rules, and whether the connection is being closed unexpectedly."),
+        (("ssl", "tls", "certificate verify failed", "certificate has expired"),
+         "A secure connection may have failed because of a TLS or certificate problem.",
+         "Check the certificate validity, hostname match, certificate chain, and system clock. Do not disable certificate checks as a shortcut."),
+        (("permission denied", "access denied", "forbidden", "operation not permitted"),
          "The process may not have permission to access a file or resource.",
-         "Check the account permissions and resource access rules."),
-        (("out of memory", "memory error", "memoryerror", "high memory"),
+         "Check the account permissions, ownership, and resource access rules."),
+        (("out of memory", "memory error", "memoryerror", "high memory", "oomkilled", "oom kill"),
          "The application may be running low on available memory.",
-         "Check memory usage and whether the process is handling unusually large data."),
-        (("file not found", "no such file", "filenotfounderror"),
+         "Check memory usage, recent workload changes, and whether the process is handling unusually large data."),
+        (("no space left", "disk full", "out of disk space"),
+         "The system may have run out of storage space.",
+         "Check available disk space and log-file growth; remove only files you are sure are safe to delete."),
+        (("file not found", "no such file", "filenotfounderror", "cannot find the path"),
          "A required file or path may be missing or incorrect.",
-         "Check the file path and confirm the file exists in the expected location."),
+         "Check the file path, filename spelling, and whether the file exists in the expected environment."),
         (("login failed", "failed login", "login failure", "authentication failed", "invalid password", "unknown user", "user not found"),
          "A sign-in attempt was rejected. The log alone does not show whether the username, password, account status, or login policy caused it.",
          "Check the username and account status, review authentication logs for the specific reason, and confirm login settings. Never store or share passwords in logs."),
         (("unauthorized", "invalid token", "token expired", "authentication required"),
          "The request may have been rejected because authentication was missing, invalid, or expired.",
          "Check that the user is signed in and that any token is valid and not expired. Never paste secrets into shared logs."),
-        (("module not found", "modulenotfounderror", "importerror"),
+        (("too many requests", "rate limit", "http 429", "status code 429"),
+         "The service may be limiting requests because too many arrived in a short period.",
+         "Check the service's rate limits, reduce request frequency, and follow any Retry-After guidance."),
+        (("404", "not found"),
+         "The requested page, route, or resource may not exist at that address.",
+         "Check the URL, route configuration, and whether the resource is available. Confirm this is an actual 404 status and not just text containing 'not found'."),
+        (("500 internal server error", "http 500", "status code 500"),
+         "The server encountered an unexpected problem while handling a request.",
+         "Review the server logs around the same timestamp and check recent code or configuration changes."),
+        (("module not found", "modulenotfounderror", "importerror", "no module named"),
          "A required code module may be missing or unavailable in the environment.",
-         "Check dependencies and the deployment environment."),
+         "Check the dependency list and deployment environment, and install the required package if appropriate."),
         (("syntaxerror", "syntax error"),
          "The program may contain code that cannot be parsed.",
          "Check the file and line number reported by the runtime for missing punctuation or invalid syntax."),
@@ -161,10 +182,10 @@ def explain_error(line):
     for phrases, meaning, action in rules:
         if any(phrase in text for phrase in phrases):
             return meaning, action
-    return ("This line is marked as an error, but its exact cause cannot be determined from the text alone.",
-            "Review the surrounding log lines and the relevant service or application documentation.")
-
-
+    return (
+        "This line is marked as an error, but its exact cause cannot be determined from the text alone.",
+        "Review nearby log lines, timestamps, and the relevant service or application documentation."
+    )
 def get_lines():
     path = "mylog.txt"
     if not os.path.exists(path):
