@@ -49,6 +49,7 @@ HTML = r"""
     .log.warning { border-left-color:#ffc857; background:#302919; }
     .log.info { border-left-color:#4bd4a3; background:#142b29; }
     .log.other { border-left-color:#7f8aa7; background:#1b2336; }
+    .explanation { margin:8px 0 14px; padding:10px 12px; border:1px solid #35548b; border-radius:8px; background:#14213a; color:#dce8ff; }
     .empty { padding:20px; text-align:center; color:var(--muted); border:1px dashed var(--line); border-radius:10px; }
     .footer { text-align:center; color:var(--muted); margin-top:24px; font-size:13px; }
     @media(max-width:650px) { .cards { grid-template-columns:repeat(2,minmax(0,1fr)); } .wrap { padding:18px 12px 30px; } .num { font-size:24px; } }
@@ -103,6 +104,7 @@ HTML = r"""
     {% if logs %}
       {% for item in logs %}
         <div class="log {{ item.kind }}">{{ item.text }}</div>
+        {% if item.explanation %}<div class="explanation"><strong>Possible meaning:</strong> {{ item.explanation }}<br><strong>Suggested check:</strong> {{ item.action }}</div>{% endif %}
       {% endfor %}
     {% else %}
       <div class="empty">No log lines match these filters.</div>
@@ -123,6 +125,42 @@ def classify(line):
     if re.search(r"\b(INFO|DEBUG|NOTICE)\b", upper):
         return "info"
     return "other"
+
+def explain_error(line):
+    """Give a cautious, rule-based hint for common log errors."""
+    text = line.lower()
+    rules = [
+        (("database", "db connection", "connection refused"),
+         "A service connection may have been refused or the database may be unavailable.",
+         "Check the database service, host/port settings, network access, and credentials."),
+        (("timeout", "timed out"),
+         "An operation took longer than the allowed time.",
+         "Check service health, network latency, and timeout settings."),
+        (("permission denied", "access denied", "forbidden"),
+         "The process may not have permission to access a file or resource.",
+         "Check the account permissions and resource access rules."),
+        (("out of memory", "memory error", "memoryerror", "high memory"),
+         "The application may be running low on available memory.",
+         "Check memory usage and whether the process is handling unusually large data."),
+        (("file not found", "no such file", "filenotfounderror"),
+         "A required file or path may be missing or incorrect.",
+         "Check the file path and confirm the file exists in the expected location."),
+        (("authentication failed", "unauthorized", "invalid password", "invalid token"),
+         "Authentication may have failed because credentials or access tokens were rejected.",
+         "Verify the credentials or token securely; never paste secrets into shared logs."),
+        (("module not found", "modulenotfounderror", "importerror"),
+         "A required code module may be missing or unavailable in the environment.",
+         "Check dependencies and the deployment environment."),
+        (("syntaxerror", "syntax error"),
+         "The program may contain code that cannot be parsed.",
+         "Check the file and line number reported by the runtime for missing punctuation or invalid syntax."),
+    ]
+    for phrases, meaning, action in rules:
+        if any(phrase in text for phrase in phrases):
+            return meaning, action
+    return ("This line is marked as an error, but its exact cause cannot be determined from the text alone.",
+            "Review the surrounding log lines and the relevant service or application documentation.")
+
 
 def get_lines():
     path = "mylog.txt"
@@ -190,7 +228,10 @@ def home():
             or (level == "INFO" and kind == "info")
         )
         if level_match and query.lower() in line.lower():
-            filtered.append({"text": line.rstrip("\n"), "kind": kind})
+            item = {"text": line.rstrip("\n"), "kind": kind}
+            if kind == "error":
+                item["explanation"], item["action"] = explain_error(line)
+            filtered.append(item)
 
     return render_template_string(
         HTML,
