@@ -99,7 +99,7 @@ HTML = r"""
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
       <h2 style="margin:0">Analysis results</h2>
       <a class="button" href="/report.html" target="_blank">Professional report</a>
-      <a class="button secondary" href="/report.csv">Download CSV report</a>
+      <a class="button" href="/report.csv">Download CSV report</a>
     </div>
     <p class="muted">Showing {{ shown }} of {{ stats.total }} lines. Counts are based on the loaded log file.</p>
     {% if logs %}
@@ -276,8 +276,8 @@ def professional_report():
     created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entries = []
     for number, line in enumerate(lines, start=1):
-        kind = classify(line)
-        text = line.rstrip("\\n")
+        text = line.rstrip("\n")
+        kind = classify(text)
         meaning, action = explain_error(text) if kind == "error" else ("", "")
         entries.append({
             "number": number,
@@ -294,20 +294,19 @@ def professional_report():
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Log Analyzer Pro — Professional Report</title>
 <style>
-:root{color-scheme:light;--ink:#182238;--muted:#5c6880;--line:#d8deea;--panel:#f5f7fb}
-*{box-sizing:border-box}body{margin:0;background:#eef2f8;color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}
-main{max-width:950px;margin:28px auto;padding:28px;background:white;border:1px solid var(--line);border-radius:14px}
-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;border-bottom:2px solid var(--line);padding-bottom:18px}
-h1{margin:0;font-size:28px}h2{font-size:18px;margin:22px 0 10px}.muted{color:var(--muted)}
+*{box-sizing:border-box}body{margin:0;background:#eef2f8;color:#182238;font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:950px;margin:28px auto;padding:28px;background:white;border:1px solid #d8deea;border-radius:14px}
+header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;border-bottom:2px solid #d8deea;padding-bottom:18px}
+h1{margin:0;font-size:28px}h2{font-size:18px;margin:22px 0 10px}.muted{color:#5c6880}
 .actions{display:flex;gap:8px;flex-wrap:wrap}button,a.btn{border:0;border-radius:8px;padding:10px 14px;background:#245ec7;color:white;text-decoration:none;font:inherit;cursor:pointer}
 .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:18px 0}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}.label{font-size:13px;color:var(--muted)}.num{font-size:26px;font-weight:750}
-table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}th{background:var(--panel)}
+.card{background:#f5f7fb;border:1px solid #d8deea;border-radius:10px;padding:14px}.label{font-size:13px;color:#5c6880}.num{font-size:26px;font-weight:750}
+table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{text-align:left;padding:10px;border-bottom:1px solid #d8deea;vertical-align:top;overflow-wrap:anywhere}th{background:#f5f7fb}
 .level{font-weight:700}.ERROR{color:#b4233a}.WARNING{color:#936200}.INFO{color:#087d5d}.OTHER{color:#5c6880}
 .explain{margin-top:6px;background:#f1f5ff;border-left:3px solid #5379c7;padding:8px 10px;border-radius:5px;font-size:13px}
-footer{margin-top:24px;padding-top:14px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+footer{margin-top:24px;padding-top:14px;border-top:1px solid #d8deea;font-size:12px;color:#5c6880}
 @media(max-width:600px){main{margin:0;padding:16px;border-radius:0}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}table{font-size:13px}th,td{padding:7px}}
-@media print{body{background:white}main{max-width:none;margin:0;padding:0;border:0} .actions{display:none} .card{break-inside:avoid}tr{break-inside:avoid}a{color:inherit}}
+@media print{body{background:white}main{max-width:none;margin:0;padding:0;border:0}.actions{display:none}.card{break-inside:avoid}tr{break-inside:avoid}}
 </style>
 </head>
 <body><main>
@@ -347,4 +346,8 @@ def download_report():
 
 @app.errorhandler(413)
 def file_too_large(_error):
-    return "File too large. Please upload a f
+    return "File too large. Please upload a file smaller than 2 MB.", 413
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
