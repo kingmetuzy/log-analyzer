@@ -14,24 +14,33 @@ PATTERN = re.compile(r"\b(CRITICAL|ERROR|ERR|WARNING|WARN|INFO|DEBUG)\b", re.I)
 REPORTS = {}
 
 STYLE = """
-:root{--bg:#f3f6fb;--card:#fff;--ink:#172033;--muted:#65718a;--line:#e1e7f0;--blue:#315efb;--red:#b42332;--amber:#946200;--green:#08784f}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,Arial,sans-serif}
-header{background:#111b30;color:#fff}.nav{max-width:1120px;margin:auto;padding:16px 22px;display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap}
-.brand{font-size:20px;font-weight:800;color:#fff;text-decoration:none}.brand span{color:#9bb0ff}.links{display:flex;gap:15px;flex-wrap:wrap}.links a{color:#d9e1f4;text-decoration:none;font-size:14px}
-main{max-width:1120px;margin:auto;padding:24px}.hero{padding:18px 0}.eyebrow{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--blue);font-weight:800}
-h1{font-size:clamp(28px,5vw,42px);line-height:1.15;margin:8px 0}h2{font-size:20px;margin:0 0 12px}.sub,.muted{color:var(--muted)}.sub{max-width:740px}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:18px 0}.card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:19px;margin:14px 0;box-shadow:0 8px 25px #1d31500b;min-width:0}
-.stat-label{font-size:13px;color:var(--muted)}.stat-value{font-size:29px;font-weight:800}.error{color:var(--red)}.warning{color:var(--amber)}.info{color:var(--green)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field{margin:12px 0}.field label{display:block;font-weight:700;font-size:13px;margin-bottom:6px}
-input[type=file],input[type=text],select{width:100%;padding:12px;border:1px solid #ccd5e4;border-radius:10px;background:#fff;font:inherit}
-button,.btn{display:inline-block;padding:11px 15px;border:0;border-radius:10px;background:var(--blue);color:#fff;font:inherit;font-weight:750;text-decoration:none;cursor:pointer}.btn.secondary{background:#e9eeff;color:#2545bb}.btn.dark{background:#172033}
-.actions{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0}.note{font-size:13px;color:var(--muted)}.flash{background:#fff0f0;color:#922b32;border:1px solid #ffd0d0;border-radius:10px;padding:12px;margin:12px 0}
-.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:11px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:12px;color:var(--muted);text-transform:uppercase}td.message{min-width:260px;max-width:600px;white-space:pre-wrap;overflow-wrap:anywhere}
-.badge{display:inline-block;border-radius:99px;background:#e9edf5;padding:3px 8px;font-size:12px;font-weight:800}.badge.ERROR,.badge.CRITICAL{background:#ffe6e7;color:#a3222c}.badge.WARNING{background:#fff0cb;color:#825700}.badge.INFO{background:#dff7eb;color:#08734e}.badge.DEBUG{background:#e7eaff;color:#344ab0}
-.tip{background:#f5f7ff;border:1px solid #e0e6ff;border-radius:10px;padding:12px;margin:9px 0}.empty{text-align:center;padding:25px;color:var(--muted)}footer{text-align:center;color:var(--muted);font-size:13px;padding:26px}
-@media(max-width:760px){main{padding:15px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.row{grid-template-columns:1fr}.card{padding:15px}.nav{padding:15px}}
-@media(max-width:400px){.stat-value{font-size:24px}.links{gap:10px}}
-@media print{header,footer,.no-print{display:none!important}body{background:#fff}main{padding:0}.card{box-shadow:none;break-inside:avoid}}
+:root{--bg:#f4f7ff;--card:#fff;--ink:#14213d;--muted:#63718b;--line:#e0e8f5;--blue:#2457e6;--blue2:#1239a8;--pale:#eaf0ff;--red:#b42332;--amber:#946200;--green:#08784f}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:radial-gradient(ellipse at top left,#e8efff 0,transparent 38%),var(--bg);color:var(--ink);font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif}
+header{background:linear-gradient(115deg,#10245b,#173eaa 58%,#2457e6);color:#fff;box-shadow:0 8px 28px #10245b24}
+.nav{max-width:1160px;margin:auto;padding:17px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.brand{font-size:21px;font-weight:850;letter-spacing:-.5px;color:#fff;text-decoration:none}.brand span{color:#b9ccff}
+.links{display:flex;gap:8px;flex-wrap:wrap}.links a{color:#e3eaff;text-decoration:none;font-size:14px;font-weight:650;padding:8px 11px;border-radius:9px;transition:background .2s}.links a:hover{background:#ffffff20;color:#fff}
+main{max-width:1160px;margin:auto;padding:30px 24px 36px}
+.hero{padding:28px 0 22px}.eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:12px;letter-spacing:1.2px;text-transform:uppercase;color:var(--blue);font-weight:850}.eyebrow:before{content:"";display:inline-block;width:20px;height:3px;border-radius:3px;background:var(--blue)}
+h1{font-size:clamp(30px,5vw,48px);line-height:1.12;letter-spacing:-1.6px;margin:10px 0 14px;font-weight:850}h2{font-size:20px;letter-spacing:-.35px;margin:0 0 12px}.sub,.muted{color:var(--muted)}.sub{max-width:740px;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:20px 0}
+.card{background:var(--card);border:1px solid #e2e9f6;border-radius:18px;padding:22px;margin:15px 0;box-shadow:0 12px 34px #163c7c0a;min-width:0}
+.grid .card{margin:0;position:relative;overflow:hidden}.grid .card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:#b9caff}.grid .card:nth-child(2):before{background:#e05a68}.grid .card:nth-child(3):before{background:#e9b949}.grid .card:nth-child(4):before{background:#2bb889}
+.stat-label{font-size:12px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.6px}.stat-value{font-size:34px;line-height:1.25;font-weight:850;letter-spacing:-1px;margin-top:7px}.error{color:var(--red)}.warning{color:var(--amber)}.info{color:var(--green)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:stretch}.field{margin:14px 0}.field label{display:block;font-weight:750;font-size:13px;margin-bottom:7px}
+input[type=file],input[type=text],select{width:100%;padding:13px 14px;border:1px solid #cbd7ec;border-radius:11px;background:#fff;color:var(--ink);font:inherit;outline:none;transition:border .2s,box-shadow .2s}
+input[type=file]:focus,input[type=text]:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 4px #2457e617}
+button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 17px;border:1px solid transparent;border-radius:11px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;font:inherit;font-weight:800;text-decoration:none;cursor:pointer;box-shadow:0 6px 15px #2457e626;transition:transform .15s,box-shadow .15s}
+button:hover,.btn:hover{transform:translateY(-1px);box-shadow:0 9px 20px #2457e632}.btn.secondary{background:var(--pale);color:#2148b9;box-shadow:none;border-color:#d7e2ff}.btn.dark{background:#182747;color:#fff;box-shadow:none}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}.note{font-size:13px;color:var(--muted)}.flash{background:#fff1f2;color:#922b32;border:1px solid #ffd0d4;border-radius:12px;padding:13px 15px;margin:12px 0}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;font-size:13px;background:#fff}th,td{text-align:left;padding:12px 13px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:11px;color:#596984;text-transform:uppercase;letter-spacing:.65px;background:#f7f9fe}tbody tr:hover{background:#f8faff}td.message{min-width:260px;max-width:600px;white-space:pre-wrap;overflow-wrap:anywhere}
+.badge{display:inline-block;border-radius:99px;background:#e9edf5;padding:4px 9px;font-size:11px;font-weight:850;letter-spacing:.3px}.badge.ERROR,.badge.CRITICAL{background:#ffe6e7;color:#a3222c}.badge.WARNING{background:#fff0cb;color:#825700}.badge.INFO{background:#dff7eb;color:#08734e}.badge.DEBUG{background:#e7eaff;color:#344ab0}
+.tip{background:#f3f6ff;border:1px solid #dce6ff;border-radius:12px;padding:13px 15px;margin:10px 0}.empty{text-align:center;padding:28px;color:var(--muted)}footer{text-align:center;color:var(--muted);font-size:13px;padding:28px 18px;border-top:1px solid #e5ebf6;background:#fff}
+@media(max-width:760px){main{padding:18px 14px 28px}.hero{padding:20px 0 12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.row{grid-template-columns:1fr;gap:4px}.card{padding:17px;border-radius:15px}.nav{padding:14px 16px}.links{gap:3px}.links a{padding:7px 8px}.stat-value{font-size:29px}}
+@media(max-width:400px){.stat-value{font-size:25px}.links a{font-size:12px}h1{letter-spacing:-.8px}}
+@media print{header,footer,.no-print{display:none!important}body{background:#fff}main{padding:0;max-width:none}.card{box-shadow:none;break-inside:avoid;border-color:#ddd}}
 """
 
 LAYOUT = """
@@ -44,9 +53,9 @@ LAYOUT = """
 """
 
 HOME = """
-<section class="hero"><div class="eyebrow">Log monitoring made simple</div><h1>Understand your logs.<br>Find issues faster.</h1>
+<section class="hero"><div class="eyebrow">Clearer logs · Faster troubleshooting</div><h1>Find the signal<br>inside your logs.</h1>
 <p class="sub">Upload a plain-text log file to count severity levels, search messages, review suggestions, and export a report.</p></section>
-<div class="row"><section class="card"><h2>Upload a log file</h2><form method="post" enctype="multipart/form-data">
+<div class="row"><section class="card"><h2>Start a log analysis</h2><p class="muted">Upload a log and get a quick, readable overview.</p><form method="post" enctype="multipart/form-data">
 <div class="field"><label for="logfile">Choose a .log or .txt file (maximum 5 MB)</label><input id="logfile" type="file" name="logfile" accept=".log,.txt,text/plain" required></div><button type="submit">Analyze logs</button></form>
 <p class="note">Supported labels include ERROR, CRITICAL, WARNING, INFO, and DEBUG.</p></section>
 <section class="card"><h2>Features</h2><p>✓ Error and warning counts</p><p>✓ Search and severity filters</p><p>✓ Smart next-step suggestions</p><p>✓ CSV export and printable reports</p></section></div>
