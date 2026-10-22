@@ -1,321 +1,379 @@
-from flask import Flask, request, render_template_string, send_file
-from collections import Counter
-from werkzeug.utils import secure_filename
 import os
-import io
 import re
+import io
 import csv
-from datetime import datetime
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 import json
+import hmac
+import hashlib
 import secrets
 import sqlite3
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from urllib.parse import urljoin
+
+import requests
+from flask import (
+    Flask, request, render_template_string, redirect, url_for,
+    session, flash, send_file, abort
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB upload limit
+app.secret_key = os.environ.get("SECRET_KEY", "")
+if not app.secret_key:
+    # Development fallback only. Set SECRET_KEY in Render for stable secure sessions.
+    app.secret_key = secrets.token_hex(32)
+
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".txt", ".log"}
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_BASE_URL = "https://api.paystack.co"
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
-HTML = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Log Analyzer Pro</title>
-  <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#141c31; --muted:#9ba8c7; --text:#f2f5ff; --line:#293653; --blue:#6ea8fe; }
-    * { box-sizing:border-box; }
-    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
-    .wrap { max-width:1050px; margin:auto; padding:24px 16px 40px; }
-    header { display:flex; justify-content:space-between; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom:22px; }
-    h1 { margin:0; font-size:clamp(24px,5vw,34px); }
-    .sub { color:var(--muted); margin:5px 0 0; }
-    .badge { background:#20345c; color:#b8d3ff; border:1px solid #35548b; padding:6px 10px; border-radius:999px; font-size:12px; }
-    .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }
-    .card,.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; }
-    .label { color:var(--muted); font-size:13px; }
-    .num { font-size:28px; font-weight:750; margin-top:4px; overflow-wrap:anywhere; }
-    .panel { margin-top:14px; }
-    h2 { font-size:18px; margin:0 0 12px; }
-    form { margin:0; }
-    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-    input,select,button,.button { border:1px solid var(--line); border-radius:9px; padding:10px 12px; font:inherit; }
-    input,select { background:#0c1427; color:var(--text); max-width:100%; }
-    input[type=file] { width:100%; }
-    button,.button { background:#2d65c8; color:white; border:0; cursor:pointer; text-decoration:none; display:inline-block; }
-    button:hover,.button:hover { filter:brightness(1.12); }
-    .secondary { background:#34415b; }
-    .notice { padding:11px 13px; border-radius:10px; margin:12px 0; background:#152d2a; border:1px solid #28685c; }
-    .error-notice { background:#3a2029; border-color:#814052; }
-    .muted { color:var(--muted); }
-    .log { border:1px solid var(--line); border-left:4px solid #5a6c8f; border-radius:8px; padding:11px 12px; margin:8px 0; overflow-wrap:anywhere; white-space:pre-wrap; }
-    .log.error { border-left-color:#ff667e; background:#2b1824; }
-    .log.warning { border-left-color:#ffc857; background:#302919; }
-    .log.info { border-left-color:#4bd4a3; background:#142b29; }
-    .log.other { border-left-color:#7f8aa7; background:#1b2336; }
-    .empty { padding:20px; text-align:center; color:var(--muted); border:1px dashed var(--line); border-radius:10px; }
-    .plans { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
-    .plan { border:1px solid var(--line); background:#101a30; padding:18px; border-radius:12px; }
-    .price { font-size:26px; font-weight:750; margin:8px 0; }
-    .footer { text-align:center; color:var(--muted); margin-top:24px; font-size:13px; }
-    @media(max-width:650px) { .cards { grid-template-columns:repeat(2,minmax(0,1fr)); } .wrap { padding:18px 12px 30px; } .num { font-size:24px; } }
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <div><h1>📊 Log Analyzer Pro</h1><p class="sub">Upload, search, and summarize application logs.</p></div>
-    <div class="row"><a class="button secondary" href="/pricing">View Pro plans</a><span class="badge">FLASK • LEVEL 5 PROJECT</span></div>
-  </header>
+# Prices are stored in kobo. Change them here if you decide on different prices.
+PLANS = {
+    "monthly": {
+        "name": "Pro Monthly", "amount": 1_500_000, "currency": "NGN",
+        "duration_days": 30, "display": "₦15,000 / month",
+    },
+    "yearly": {
+        "name": "Pro Yearly", "amount": 15_000_000, "currency": "NGN",
+        "duration_days": 365, "display": "₦150,000 / year",
+    },
+}
+FREE_FEATURES = [
+    "Upload .txt and .log files (up to 2 MB)",
+    "Count errors, warnings, information and other lines",
+    "Search and filter log messages",
+]
+PRO_FEATURES = [
+    "Everything in Free",
+    "Download CSV reports",
+    "Save verified Pro access for the subscription period",
+    "Priority access to future Pro tools",
+]
 
-  {% if message %}<div class="notice {% if is_error %}error-notice{% endif %}">{{ message }}</div>{% endif %}
+# This app supports PostgreSQL via DATABASE_URL or SQLite locally.
+# For Render production, use a managed PostgreSQL database for durable user/payment records.
+def db_connection():
+    if DATABASE_URL.startswith(("postgres://", "postgresql://")):
+        import psycopg
+        from psycopg.rows import dict_row
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        return conn, "postgres"
+    path = os.environ.get("SQLITE_PATH", "log_analyzer.db")
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn, "sqlite"
 
-  <section class="cards">
-    <div class="card"><div class="label">Total log lines</div><div class="num">{{ stats.total }}</div></div>
-    <div class="card"><div class="label">Errors</div><div class="num">{{ stats.errors }}</div></div>
-    <div class="card"><div class="label">Warnings</div><div class="num">{{ stats.warnings }}</div></div>
-    <div class="card"><div class="label">Info / other</div><div class="num">{{ stats.info_other }}</div></div>
-  </section>
+def db_execute(conn, db_kind, sql, params=()):
+    if db_kind == "postgres":
+        sql = sql.replace("?", "%s")
+    return conn.execute(sql, params)
 
-  <section class="panel">
-    <h2>Upload a log file</h2>
-    <form method="post" enctype="multipart/form-data" class="row">
-      <input type="file" name="logfile" accept=".txt,.log,text/plain" required>
-      <button type="submit">Upload &amp; analyze</button>
-    </form>
-    <p class="muted">Text files only, maximum 2 MB. Use sample or redacted logs; avoid passwords, tokens, and personal data.</p>
-  </section>
+def init_db():
+    conn, kind = db_connection()
+    try:
+        if kind == "postgres":
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id),
+                    reference TEXT UNIQUE NOT NULL,
+                    plan_key TEXT NOT NULL,
+                    amount BIGINT NOT NULL,
+                    currency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    paid_at TEXT,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+        else:
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    reference TEXT UNIQUE NOT NULL,
+                    plan_key TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    currency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    paid_at TEXT,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
 
-  <section class="panel">
-    <h2>Search and filter</h2>
-    <form method="get" class="row">
-      <input name="q" value="{{ query }}" placeholder="Search log text…" aria-label="Search log text">
-      <select name="level" aria-label="Filter by log level">
-        <option value="ALL" {% if level == 'ALL' %}selected{% endif %}>All levels</option>
-        <option value="ERROR" {% if level == 'ERROR' %}selected{% endif %}>Errors</option>
-        <option value="WARNING" {% if level == 'WARNING' %}selected{% endif %}>Warnings</option>
-        <option value="INFO" {% if level == 'INFO' %}selected{% endif %}>Info</option>
-      </select>
-      <button type="submit">Apply filters</button>
-      <a class="button secondary" href="/">Clear filters</a>
-    </form>
-  </section>
+init_db()
 
-  <section class="panel">
-    <div class="row" style="justify-content:space-between;margin-bottom:10px">
-      <h2 style="margin:0">Analysis results</h2>
-      <a class="button" href="/report.csv">Download CSV report</a>
-    </div>
-    <p class="muted">Showing {{ shown }} of {{ stats.total }} lines. Counts are based on the loaded log file.</p>
-    {% if logs %}
-      {% for item in logs %}
-        <div class="log {{ item.kind }}">{{ item.text }}</div>
-      {% endfor %}
-    {% else %}
-      <div class="empty">No log lines match these filters.</div>
-    {% endif %}
-  </section>
-  <div class="footer">Log Analyzer Pro • Built with Flask • Analyze only logs you are authorized to access.</div>
-</div>
-</body>
-</html>
-"""
+def utc_now():
+    return datetime.now(timezone.utc)
 
-PRICING_HTML = r"""
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Log Analyzer Pro plans</title>
-<style>body{margin:0;background:#0b1020;color:#f2f5ff;font:16px/1.5 system-ui,sans-serif}.wrap{max-width:850px;margin:auto;padding:24px 16px}.panel{background:#141c31;border:1px solid #293653;border-radius:14px;padding:20px;margin:14px 0}.plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.plan{background:#101a30;border:1px solid #293653;border-radius:12px;padding:18px}.price{font-size:26px;font-weight:750}input{display:block;width:100%;box-sizing:border-box;margin:10px 0;padding:12px;border-radius:8px;border:1px solid #293653;background:#0c1427;color:#fff}button,.button{display:inline-block;background:#2d65c8;color:white;padding:11px 14px;border:0;border-radius:8px;text-decoration:none;cursor:pointer}.muted{color:#9ba8c7}.notice{padding:12px;background:#152d2a;border:1px solid #28685c;border-radius:9px;margin:12px 0}.error{background:#3a2029;border-color:#814052}</style></head><body><div class="wrap"><h1>💎 Log Analyzer Pro</h1><p class="muted">Choose a plan. Payments are processed securely by Paystack.</p>
-{% if message %}<div class="notice {% if is_error %}error{% endif %}">{{ message }}</div>{% endif %}
-<div class="plans"><div class="plan"><h2>Free</h2><div class="price">₦0</div><p>Use the current log analyzer features.</p><a class="button" href="/">Continue free</a></div><div class="plan"><h2>Pro Monthly</h2><div class="price">₦15,000</div><p>Proposed monthly price. This checkout is a one-time payment, not an automatic recurring subscription.</p></div><div class="plan"><h2>Pro Yearly</h2><div class="price">₦150,000</div><p>Proposed yearly price. This checkout is a one-time payment, not an automatic recurring subscription.</p></div></div>
-<div class="panel"><h2>Continue to secure checkout</h2><p class="muted">Enter your email and select a plan. Do not enter your card details on this website; Paystack handles card entry.</p><form method="post" action="/paystack/initialize"><input type="email" name="email" placeholder="Your email address" required maxlength="254"><select name="plan" required style="display:block;width:100%;box-sizing:border-box;margin:10px 0;padding:12px;border-radius:8px;background:#0c1427;color:#fff"><option value="monthly">Pro Monthly — ₦15,000</option><option value="yearly">Pro Yearly — ₦150,000</option></select><button type="submit">Continue to Paystack</button></form></div><p><a class="button" href="/">Back to analyzer</a></p><p class="muted">International/USD checkout is not enabled in this initial version. It depends on your Paystack account's approved currencies and settings.</p></div></body></html>
-"""
+def iso(dt):
+    return dt.astimezone(timezone.utc).isoformat()
 
-def classify(line):
-    upper = line.upper()
-    if re.search(r"\b(ERROR|FATAL|CRITICAL|EXCEPTION)\b", upper):
-        return "error"
-    if re.search(r"\b(WARN|WARNING)\b", upper):
-        return "warning"
-    if re.search(r"\b(INFO|DEBUG|NOTICE)\b", upper):
-        return "info"
-    return "other"
+def parse_dt(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
-def get_lines():
-    path = "mylog.txt"
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(
-                "INFO: Log Analyzer is ready\n"
-                "ERROR: Example database connection failed\n"
-                "WARNING: Example high memory usage\n"
-                "INFO: Upload a .txt or .log file to analyze\n"
-            )
-    with open(path, "r", encoding="utf-8", errors="replace") as file:
-        return file.readlines()
+def current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    conn, kind = db_connection()
+    try:
+        row = db_execute(conn, kind, "SELECT id, email FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
-def analyze():
-    lines = get_lines()
-    counts = Counter(classify(line) for line in lines)
-    return lines, {
-        "total": len(lines),
-        "errors": counts["error"],
-        "warnings": counts["warning"],
-        "info_other": counts["info"] + counts["other"],
+def active_pro(user_id):
+    if not user_id:
+        return False
+    conn, kind = db_connection()
+    try:
+        row = db_execute(conn, kind, """
+            SELECT expires_at FROM payments
+            WHERE user_id = ? AND status = 'success'
+            ORDER BY expires_at DESC LIMIT 1
+        """, (user_id,)).fetchone()
+        expiry = parse_dt(row["expires_at"]) if row else None
+        return bool(expiry and expiry > utc_now())
+    finally:
+        conn.close()
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            flash("Please create an account or log in first.", "error")
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
+
+def csrf_token():
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return session["csrf_token"]
+
+@app.context_processor
+def inject_globals():
+    return {
+        "current_user": current_user(),
+        "is_pro": active_pro(session.get("user_id")),
+        "csrf_token": csrf_token,
+        "plans": PLANS,
+        "free_features": FREE_FEATURES,
+        "pro_features": PRO_FEATURES,
     }
+
+@app.before_request
+def protect_post_requests():
+    if request.method == "POST":
+        sent = request.form.get("csrf_token", "")
+        expected = session.get("csrf_token", "")
+        if not sent or not expected or not hmac.compare_digest(sent, expected):
+            abort(400, description="Security check failed. Refresh the page and try again.")
+
+def base_template(content):
+    return r"""
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title or "Log Analyzer Pro" }}</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#141c31;--muted:#aab6d0;--text:#f2f5ff;--line:#293653;--blue:#3978e8;--green:#1c9b72}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{max-width:1080px;margin:auto;padding:22px 14px 40px}header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+h1{font-size:clamp(25px,5vw,35px);margin:0}h2{font-size:20px;margin:0 0 12px}h3{margin:0 0 6px}.muted{color:var(--muted)}.nav{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+a{color:#9cc2ff}.button,button{display:inline-block;background:var(--blue);color:white;border:0;border-radius:9px;padding:10px 14px;font:inherit;text-decoration:none;cursor:pointer}
+.secondary{background:#34415b}.green{background:var(--green)}.panel,.card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:17px;margin:14px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.price{font-size:27px;font-weight:750;margin:8px 0}.badge{background:#20345c;color:#c8dcff;border:1px solid #35548b;border-radius:999px;padding:5px 10px;font-size:12px}
+input,select{width:100%;max-width:100%;padding:11px 12px;margin:5px 0 12px;border-radius:9px;border:1px solid var(--line);background:#0c1427;color:var(--text);font:inherit}
+input[type=file]{padding:8px}label{font-weight:600}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row>*{flex:0 1 auto}
+.notice{padding:12px 14px;border-radius:10px;margin:10px 0;background:#16342e;border:1px solid #28685c}.notice.error{background:#3a2029;border-color:#814052}
+.stat{font-size:28px;font-weight:750}.log{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--line);border-left:4px solid #7f8aa7;border-radius:8px;padding:10px;margin:8px 0}.errorline{border-left-color:#ff667e;background:#2b1824}.warningline{border-left-color:#ffc857;background:#302919}.infoline{border-left-color:#4bd4a3;background:#142b29}
+li{margin:5px 0}.footer{text-align:center;color:var(--muted);font-size:12px;margin-top:28px}
+@media(max-width:600px){.wrap{padding:16px 11px 30px}.panel,.card{padding:14px}.price{font-size:24px}}
+</style></head><body><div class="wrap">
+<header><div><h1>📊 Log Analyzer Pro</h1><div class="muted">Understand your application logs faster.</div></div>
+<nav class="nav"><a class="button secondary" href="/">Analyzer</a><a class="button secondary" href="/pricing">Pricing</a>
+{% if current_user %}<span class="badge">{{ current_user.email }}</span><a class="button secondary" href="/account">Account</a>
+<form method="post" action="/logout" style="margin:0"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">Log out</button></form>
+{% else %}<a class="button secondary" href="/login">Log in</a><a class="button" href="/register">Create account</a>{% endif %}
+</nav></header>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+""" + content + r"""
+<div class="footer">Log Analyzer Pro · Only analyze logs you are authorized to access. Do not upload passwords, access tokens, or sensitive personal data.</div>
+</div></body></html>
+"""
+
+HOME_CONTENT = r"""
+<section class="panel"><span class="badge">{% if is_pro %}PRO ACTIVE{% else %}FREE PLAN{% endif %}</span>
+<h2 style="margin-top:12px">Upload and analyze a log file</h2>
+<p class="muted">Upload a .txt or .log file up to 2 MB. Files are analyzed for this request and are not shared with other users.</p>
+<form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label for="logfile">Choose log file</label><input id="logfile" type="file" name="logfile" accept=".txt,.log,text/plain" required>
+<button type="submit">Upload &amp; analyze</button></form></section>
+{% if analyzed %}
+<section class="grid"><div class="card"><div class="muted">Total lines</div><div class="stat">{{ stats.total }}</div></div><div class="card"><div class="muted">Errors</div><div class="stat">{{ stats.errors }}</div></div><div class="card"><div class="muted">Warnings</div><div class="stat">{{ stats.warnings }}</div></div><div class="card"><div class="muted">Info / other</div><div class="stat">{{ stats.info_other }}</div></div></section>
+<section class="panel"><h2>Search and filter</h2><form method="get" class="row"><input style="flex:2" name="q" value="{{ query }}" placeholder="Search log text"><select style="flex:1" name="level"><option value="ALL" {% if level=='ALL' %}selected{% endif %}>All levels</option><option value="ERROR" {% if level=='ERROR' %}selected{% endif %}>Errors</option><option value="WARNING" {% if level=='WARNING' %}selected{% endif %}>Warnings</option><option value="INFO" {% if level=='INFO' %}selected{% endif %}>Info</option></select><button>Apply</button></form>
+<p class="muted">Showing {{ shown }} of {{ stats.total }} lines.</p>
+{% for item in logs %}<div class="log {{ item.kind }}">{{ item.text }}</div>{% else %}<p class="muted">No matching lines.</p>{% endfor %}
+{% if is_pro %}<a class="button green" href="/report.csv">Download CSV report</a>{% else %}<p class="muted">CSV export is a Pro feature. <a href="/pricing">Upgrade to Pro</a>.</p>{% endif %}
+</section>{% endif %}
+"""
 
 @app.route("/", methods=["GET", "POST"])
 def home():
     message = ""
-    is_error = False
-
+    raw_lines = None
     if request.method == "POST":
-        uploaded = request.files.get("logfile")
-        if not uploaded or not uploaded.filename:
-            message, is_error = "Choose a .txt or .log file first.", True
+        upload = request.files.get("logfile")
+        if not upload or not upload.filename:
+            flash("Choose a .txt or .log file first.", "error")
         else:
-            filename = secure_filename(uploaded.filename)
-            extension = os.path.splitext(filename)[1].lower()
-            if extension not in ALLOWED_EXTENSIONS:
-                message, is_error = "Unsupported file type. Please upload a .txt or .log file.", True
+            filename = secure_filename(upload.filename)
+            if os.path.splitext(filename)[1].lower() not in ALLOWED_EXTENSIONS:
+                flash("Only .txt and .log files are supported.", "error")
             else:
-                content = uploaded.read()
+                content = upload.read(app.config["MAX_CONTENT_LENGTH"] + 1)
                 if len(content) > app.config["MAX_CONTENT_LENGTH"]:
-                    message, is_error = "File is too large. Maximum size is 2 MB.", True
+                    flash("File too large. Maximum size is 2 MB.", "error")
                 else:
-                    try:
-                        decoded = content.decode("utf-8", errors="replace")
-                        with open("mylog.txt", "w", encoding="utf-8") as file:
-                            file.write(decoded)
-                        message = f"Successfully loaded {len(decoded.splitlines())} log lines from {filename}."
-                    except OSError:
-                        message, is_error = "The uploaded file could not be saved. Please try again.", True
-
-    all_lines, stats = analyze()
+                    raw_lines = content.decode("utf-8", errors="replace").splitlines()
+                    session["last_upload_lines"] = raw_lines
+                    session["last_upload_name"] = filename
+                    flash(f"Loaded {len(raw_lines)} lines from {filename}.", "success")
+                    return redirect(url_for("home"))
+    raw_lines = session.get("last_upload_lines")
+    analyzed = raw_lines is not None
+    if not analyzed:
+        return render_template_string(base_template(HOME_CONTENT), title="Log Analyzer Pro", analyzed=False,
+                                      stats={"total": 0, "errors": 0, "warnings": 0, "info_other": 0},
+                                      logs=[], shown=0, query="", level="ALL")
+    def classify(line):
+        upper = line.upper()
+        if re.search(r"\b(ERROR|FATAL|CRITICAL|EXCEPTION)\b", upper): return "errorline"
+        if re.search(r"\b(WARN|WARNING)\b", upper): return "warningline"
+        if re.search(r"\b(INFO|DEBUG|NOTICE)\b", upper): return "infoline"
+        return "otherline"
+    counts = [classify(x) for x in raw_lines]
+    stats = {"total": len(raw_lines), "errors": counts.count("errorline"), "warnings": counts.count("warningline"),
+             "info_other": counts.count("infoline") + counts.count("otherline")}
     query = request.args.get("q", "").strip()[:200]
     level = request.args.get("level", "ALL").upper()
-    if level not in {"ALL", "ERROR", "WARNING", "INFO"}:
-        level = "ALL"
-
-    filtered = []
-    for line in all_lines:
+    if level not in {"ALL", "ERROR", "WARNING", "INFO"}: level = "ALL"
+    kind_to_level = {"errorline": "ERROR", "warningline": "WARNING", "infoline": "INFO", "otherline": "OTHER"}
+    logs = []
+    for line in raw_lines:
         kind = classify(line)
-        level_match = (
-            level == "ALL"
-            or (level == "ERROR" and kind == "error")
-            or (level == "WARNING" and kind == "warning")
-            or (level == "INFO" and kind == "info")
-        )
-        if level_match and query.lower() in line.lower():
-            filtered.append({"text": line.rstrip("\n"), "kind": kind})
+        if (level == "ALL" or kind_to_level[kind] == level) and query.lower() in line.lower():
+            logs.append({"text": line, "kind": kind})
+    return render_template_string(base_template(HOME_CONTENT), title="Log Analyzer Pro", analyzed=True,
+                                  stats=stats, logs=logs, shown=len(logs), query=query, level=level)
 
-    return render_template_string(
-        HTML,
-        stats=stats,
-        logs=filtered,
-        shown=len(filtered),
-        query=query,
-        level=level,
-        message=message,
-        is_error=is_error,
-    )
+AUTH_CONTENT = r"""
+<section class="panel" style="max-width:520px;margin:25px auto"><h2>{{ heading }}</h2><p class="muted">{{ helper }}</p>
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
+<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="{{ autocomplete }}" minlength="10" required>
+<button type="submit">{{ action }}</button></form><p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>
+"""
 
-@app.route("/report.csv", methods=["GET"])
-def download_report():
-    lines, _ = analyze()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Line number", "Level", "Log message"])
-    for number, line in enumerate(lines, start=1):
-        kind = classify(line)
-        writer.writerow([number, kind.upper(), line.rstrip("\n")])
-    data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-    return send_file(
-        data,
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=f"log-analysis-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
-    )
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user(): return redirect(url_for("account"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 254:
+            flash("Enter a valid email address.", "error")
+        elif len(password) < 10:
+            flash("Use a password with at least 10 characters.", "error")
+        else:
+            conn, kind = db_connection()
+            try:
+                db_execute(conn, kind, "INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)",
+                           (email, generate_password_hash(password), iso(utc_now())))
+                conn.commit()
+                row = db_execute(conn, kind, "SELECT id,email FROM users WHERE email = ?", (email,)).fetchone()
+                session.clear()
+                session["user_id"] = row["id"]
+                session["csrf_token"] = secrets.token_urlsafe(32)
+                flash("Account created. You can use the Free plan or choose Pro.", "success")
+                return redirect(url_for("pricing"))
+            except Exception as exc:
+                if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+                    flash("An account with that email already exists. Please log in.", "error")
+                else:
+                    app.logger.exception("Registration failed")
+                    flash("We couldn't create your account. Please try again.", "error")
+            finally:
+                conn.close()
+    return render_template_string(base_template(AUTH_CONTENT), title="Create account", heading="Create your account",
+        helper="Create an account to manage your plan and payments.", action="Create account",
+        autocomplete="new-password", switch_text="Already have an account?", switch_url=url_for("login"), switch_label="Log in")
 
-@app.errorhandler(413)
-def file_too_large(_error):
-    return "File too large. Please upload a file smaller than 2 MB.", 413
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user(): return redirect(url_for("account"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        conn, kind = db_connection()
+        try:
+            row = db_execute(conn, kind, "SELECT id,email,password_hash FROM users WHERE email = ?", (email,)).fetchone()
+        finally:
+            conn.close()
+        if row and check_password_hash(row["password_hash"], password):
+            session.clear()
+            session["user_id"] = row["id"]
+            session["csrf_token"] = secrets.token_urlsafe(32)
+            return redirect(url_for("account"))
+        flash("Email or password is incorrect.", "error")
+    return render_template_string(base_template(AUTH_CONTENT), title="Log in", heading="Welcome back",
+        helper="Log in to view your account and Pro access.", action="Log in", autocomplete="current-password",
+        switch_text="New here?", switch_url=url_for("register"), switch_label="Create account")
 
-def payment_db():
-    """Create a small local record of Paystack transactions."""
-    with sqlite3.connect("payments.sqlite3") as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS payments (
-            reference TEXT PRIMARY KEY, email TEXT NOT NULL, plan TEXT NOT NULL,
-            amount_kobo INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
-        )""")
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    flash("You have logged out.", "success")
+    return redirect(url_for("home"))
 
-@app.route("/pricing", methods=["GET"])
+@app.route("/pricing")
 def pricing():
-    return render_template_string(PRICING_HTML, message="", is_error=False)
-
-@app.route("/paystack/initialize", methods=["POST"])
-def paystack_initialize():
-    secret = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
-    if not secret:
-        return render_template_string(PRICING_HTML, message="Payments are not configured yet. Please try again later.", is_error=True), 503
-    email = request.form.get("email", "").strip().lower()
-    plan = request.form.get("plan", "")
-    if len(email) > 254 or "@" not in email or plan not in {"monthly", "yearly"}:
-        return render_template_string(PRICING_HTML, message="Please enter a valid email and choose a plan.", is_error=True), 400
-    # Amounts are in kobo. These are proposed prices and can be changed before launch.
-    amount = {"monthly": 1_500_000, "yearly": 15_000_000}[plan]
-    reference = "lap_" + secrets.token_urlsafe(18)
-    payload = {"email": email, "amount": amount, "currency": "NGN", "reference": reference,
-               "callback_url": request.url_root.rstrip("/") + "/paystack/callback",
-               "metadata": {"custom_fields": [{"display_name": "Plan", "variable_name": "plan", "value": plan}]}}
-    try:
-        req = Request("https://api.paystack.co/transaction/initialize", data=json.dumps(payload).encode("utf-8"),
-                      headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"}, method="POST")
-        with urlopen(req, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if not result.get("status") or not result.get("data", {}).get("authorization_url"):
-            raise ValueError("Paystack did not return a checkout URL")
-        payment_db()
-        with sqlite3.connect("payments.sqlite3") as conn:
-            conn.execute("INSERT INTO payments(reference,email,plan,amount_kobo,status,created_at) VALUES(?,?,?,?,?,?)",
-                         (reference, email, plan, amount, "pending", datetime.utcnow().isoformat()))
-        return __import__("flask").redirect(result["data"]["authorization_url"])
-    except (URLError, HTTPError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
-        app.logger.warning("Paystack initialization failed: %s", type(exc).__name__)
-        return render_template_string(PRICING_HTML, message="We could not start checkout. Please try again later.", is_error=True), 502
-
-@app.route("/paystack/callback", methods=["GET"])
-def paystack_callback():
-    secret = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
-    reference = request.args.get("reference", "").strip()
-    if not secret or not reference or len(reference) > 100:
-        return render_template_string(PRICING_HTML, message="We could not verify this payment. Please contact support if you were charged.", is_error=True), 400
-    try:
-        req = Request("https://api.paystack.co/transaction/verify/" + reference,
-                      headers={"Authorization": "Bearer " + secret}, method="GET")
-        with urlopen(req, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        data = result.get("data", {})
-        payment_db()
-        with sqlite3.connect("payments.sqlite3") as conn:
-            row = conn.execute("SELECT email, plan, amount_kobo, status FROM payments WHERE reference=?", (reference,)).fetchone()
-            if not row:
-                return render_template_string(PRICING_HTML, message="This payment reference is not recognized by the site.", is_error=True), 400
-            email, plan, expected_amount, old_status = row
-            verified = (result.get("status") and data.get("status") == "success"
-                        and data.get("reference") == reference and data.get("currency") == "NGN"
-                        and data.get("amount") == expected_amount and str(data.get("customer", {}).get("email", "")).lower() == email)
-            if not verified:
-                conn.execute("UPDATE payments SET status=? WHERE reference=?", ("verification_failed", reference))
-                return render_template_string(PRICING_HTML, message="Paystack could not confirm the expected successful payment. No Pro access has been granted.", is_error=True), 400
-            conn.execute("UPDATE payments SET status=? WHERE reference=?", ("verified", reference))
-        # This verifies and records payment only. Account login and durable Pro entitlement
-        # are intentionally not claimed here; those must be added before selling Pro access.
-        return render_template_string(PRICING_HTML, message="Payment verified successfully for " + email + ". Your payment is recorded, but Pro access is not activated yet. Please do not advertise this checkout as a finished subscription until account access and renewals are implemented.", is_error=False)
-    except (URLError, HTTPError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
-        app.logger.warning("Paystack verification failed: %s", type(exc).__name__)
-        return render_template_string(PRICING_HTML, message="We could not verify the payment right now. If you were charged, contact support before trying again.", is_error=True), 502
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    content = r"""
+<section class="panel"><h2>Choose your plan</h2><p class="muted">Start free, or upgrade to unlock CSV export. Pro access lasts for the purchased period.</p>
+<div class="grid"><article class="card"><h3>Free</h3><div class="price">₦0</div><ul>{% for feature in free_features %}<li>{{ feature }}</li>{% endfor %}</ul><a class="button secondary" href="/">Use Free</a></article>
+{% for key,plan in plans.items() %}<article class="card"><span class="badge">PRO</span><h3 style="margin-top:10px">{{ plan.name }}</h3><div class="price">{{ plan.display }}</div><ul>{% for feature in pro_features %}<li>{{ feature }}</li>{% endfor %}</ul>
+{% if current_user %}<form method="post" action="/checkout/{{ key }}"><input type="hidden" name="csrf_token" value="{{ cs
