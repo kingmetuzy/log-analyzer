@@ -31,6 +31,8 @@ PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_BASE_URL = "https://api.paystack.co"
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
+BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
 
 # Prices are stored in kobo. Change them here if you decide on different prices.
 PLANS = {
@@ -119,6 +121,28 @@ def init_db():
                     status TEXT NOT NULL,
                     paid_at TEXT,
                     expires_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+        if kind == "postgres":
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id),
+                    token_hash TEXT UNIQUE NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+        else:
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    token_hash TEXT UNIQUE NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
@@ -360,9 +384,136 @@ def login():
             session["csrf_token"] = secrets.token_urlsafe(32)
             return redirect(url_for("account"))
         flash("Email or password is incorrect.", "error")
-    return render_template_string(base_template(AUTH_CONTENT), title="Log in", heading="Welcome back",
+    login_content = AUTH_CONTENT.replace(
+        '<p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>',
+        '<p class="muted"><a href="/forgot-password">Forgot your password?</a></p><p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>'
+    )
+    return render_template_string(base_template(login_content), title="Log in", heading="Welcome back",
         helper="Log in to view your account and Pro access.", action="Log in", autocomplete="current-password",
         switch_text="New here?", switch_url=url_for("register"), switch_label="Create account")
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    content = r"""
+    <section class="panel" style="max-width:520px;margin:25px auto">
+      <h2>Forgot your password?</h2>
+      <p class="muted">Enter the email address on your account. If it exists, we'll send a reset link.</p>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="email">Email address</label>
+        <input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
+        <button type="submit">Send reset link</button>
+      </form>
+      <p class="muted"><a href="{{ url_for('login') }}">Back to log in</a></p>
+    </section>
+    """
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        # Always show the same response to avoid revealing registered accounts.
+        generic_message = "If an account exists for that email, a password-reset link will be sent."
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) and len(email) <= 254:
+            conn, kind = db_connection()
+            try:
+                row = db_execute(conn, kind, "SELECT id, email FROM users WHERE email = ?", (email,)).fetchone()
+                if row:
+                    raw_token = secrets.token_urlsafe(32)
+                    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+                    now = utc_now()
+                    expires = now + timedelta(minutes=30)
+                    db_execute(conn, kind,
+                        "UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
+                        (iso(now), row["id"]))
+                    db_execute(conn, kind, """
+                        INSERT INTO password_resets(user_id, token_hash, expires_at, created_at)
+                        VALUES(?,?,?,?)
+                    """, (row["id"], token_hash, iso(expires), iso(now)))
+                    conn.commit()
+                    base_url = public_base_url()
+                    if not BREVO_API_KEY or not BREVO_SENDER_EMAIL or not base_url:
+                        app.logger.error("Password reset email not configured: set BREVO_API_KEY, BREVO_SENDER_EMAIL, and APP_BASE_URL or RENDER_EXTERNAL_URL")
+                    else:
+                        reset_url = base_url + url_for("reset_password", token=raw_token)
+                        payload = {
+                            "sender": {"email": BREVO_SENDER_EMAIL, "name": "Log Analyzer Pro"},
+                            "to": [{"email": row["email"]}],
+                            "subject": "Reset your Log Analyzer Pro password",
+                            "textContent": (
+                                "We received a request to reset your Log Analyzer Pro password. "
+                                "Use this link within 30 minutes: " + reset_url +
+                                "\n\nIf you did not request this, you can ignore this email."
+                            ),
+                        }
+                        try:
+                            response = requests.post(
+                                "https://api.brevo.com/v3/smtp/email",
+                                headers={"api-key": BREVO_API_KEY, "accept": "application/json",
+                                         "content-type": "application/json"},
+                                json=payload, timeout=15)
+                            if not response.ok:
+                                app.logger.error("Brevo password reset email failed: status=%s response=%s",
+                                                 response.status_code, response.text[:500])
+                        except requests.RequestException:
+                            app.logger.exception("Brevo password reset email request failed")
+            except Exception:
+                conn.rollback()
+                app.logger.exception("Could not create password reset request")
+            finally:
+                conn.close()
+        flash(generic_message, "success")
+        return redirect(url_for("forgot_password"))
+    return render_template_string(base_template(content), title="Forgot password")
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    if not token or len(token) > 200:
+        flash("That password-reset link is invalid or expired. Request a new one.", "error")
+        return redirect(url_for("forgot_password"))
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn, kind = db_connection()
+    try:
+        row = db_execute(conn, kind, """
+            SELECT id, user_id, expires_at, used_at FROM password_resets
+            WHERE token_hash = ?
+        """, (token_hash,)).fetchone()
+        valid = bool(row and not row["used_at"] and parse_dt(row["expires_at"]) and
+                     parse_dt(row["expires_at"]) > utc_now())
+        if not valid:
+            flash("That password-reset link is invalid or expired. Request a new one.", "error")
+            return redirect(url_for("forgot_password"))
+        if request.method == "POST":
+            password = request.form.get("password", "")
+            confirm = request.form.get("confirm_password", "")
+            if len(password) < 10:
+                flash("Use a password with at least 10 characters.", "error")
+            elif password != confirm:
+                flash("The passwords do not match.", "error")
+            else:
+                now = iso(utc_now())
+                db_execute(conn, kind, "UPDATE users SET password_hash = ? WHERE id = ?",
+                           (generate_password_hash(password), row["user_id"]))
+                db_execute(conn, kind, "UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
+                           (now, row["user_id"]))
+                conn.commit()
+                session.clear()
+                flash("Your password has been reset. Please log in with your new password.", "success")
+                return redirect(url_for("login"))
+    finally:
+        conn.close()
+    content = r"""
+    <section class="panel" style="max-width:520px;margin:25px auto">
+      <h2>Choose a new password</h2>
+      <p class="muted">Use at least 10 characters.</p>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="password">New password</label>
+        <input id="password" name="password" type="password" autocomplete="new-password" minlength="10" required>
+        <label for="confirm_password">Confirm new password</label>
+        <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
+        <button type="submit">Reset password</button>
+      </form>
+    </section>
+    """
+    return render_template_string(base_template(content), title="Reset password")
 
 @app.route("/logout", methods=["POST"])
 def logout():
