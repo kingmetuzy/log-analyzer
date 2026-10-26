@@ -7,6 +7,8 @@ import hmac
 import hashlib
 import secrets
 import sqlite3
+import time
+import threading
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import urljoin
@@ -33,6 +35,14 @@ APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
 BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
+APP_BASE_URL = APP_BASE_URL or "https://log-analyzer-wroa.onrender.com"
+
+# Temporary server-side analysis storage avoids putting uploaded logs in browser cookies.
+# Entries expire after 30 minutes and are not written to the database.
+ANALYSES = {}
+ANALYSES_LOCK = threading.Lock()
+ANALYSIS_TTL_SECONDS = 30 * 60
+ANALYSIS_MAX_ENTRIES = 100
 
 # Prices are stored in kobo. Change them here if you decide on different prices.
 PLANS = {
@@ -101,6 +111,15 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id),
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
         else:
             db_execute(conn, kind, """
                 CREATE TABLE IF NOT EXISTS users (
@@ -124,23 +143,10 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
-        if kind == "postgres":
             db_execute(conn, kind, """
-                CREATE TABLE IF NOT EXISTS password_resets (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL REFERENCES users(id),
-                    token_hash TEXT UNIQUE NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    used_at TEXT,
-                    created_at TEXT NOT NULL
-                )
-            """)
-        else:
-            db_execute(conn, kind, """
-                CREATE TABLE IF NOT EXISTS password_resets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    token_hash TEXT PRIMARY KEY,
                     user_id INTEGER NOT NULL REFERENCES users(id),
-                    token_hash TEXT UNIQUE NOT NULL,
                     expires_at TEXT NOT NULL,
                     used_at TEXT,
                     created_at TEXT NOT NULL
@@ -222,11 +228,72 @@ def inject_globals():
 
 @app.before_request
 def protect_post_requests():
+    # Paystack webhooks authenticate with their HMAC signature, not browser CSRF tokens.
+    if request.endpoint == "paystack_webhook":
+        return
     if request.method == "POST":
         sent = request.form.get("csrf_token", "")
         expected = session.get("csrf_token", "")
         if not sent or not expected or not hmac.compare_digest(sent, expected):
             abort(400, description="Security check failed. Refresh the page and try again.")
+
+
+def clean_analyses():
+    now = time.monotonic()
+    with ANALYSES_LOCK:
+        expired = [key for key, value in ANALYSES.items() if now - value["created"] > ANALYSIS_TTL_SECONDS]
+        for key in expired:
+            ANALYSES.pop(key, None)
+        if len(ANALYSES) > ANALYSIS_MAX_ENTRIES:
+            oldest = sorted(ANALYSES, key=lambda key: ANALYSES[key]["created"])
+            for key in oldest[:len(ANALYSES) - ANALYSIS_MAX_ENTRIES]:
+                ANALYSES.pop(key, None)
+
+def get_last_analysis():
+    analysis_id = session.get("last_analysis_id")
+    if not analysis_id:
+        return None
+    with ANALYSES_LOCK:
+        item = ANALYSES.get(analysis_id)
+        if item and time.monotonic() - item["created"] <= ANALYSIS_TTL_SECONDS:
+            return item
+        ANALYSES.pop(analysis_id, None)
+    session.pop("last_analysis_id", None)
+    return None
+
+def send_reset_email(email, reset_url):
+    """Send a password reset email through Brevo's transactional email API."""
+    if not BREVO_API_KEY or not BREVO_SENDER_EMAIL:
+        raise RuntimeError("Brevo email delivery is not configured")
+    try:
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json",
+            },
+            json={
+                "sender": {"name": "Log Analyzer Pro", "email": BREVO_SENDER_EMAIL},
+                "to": [{"email": email}],
+                "subject": "Reset your Log Analyzer Pro password",
+                "textContent": (
+                    "We received a request to reset your Log Analyzer Pro password.\n\n"
+                    f"Use this link within 30 minutes: {reset_url}\n\n"
+                    "If you did not request this, you can ignore this email."
+                ),
+            },
+            timeout=(4, 10),
+        )
+    except requests.RequestException as exc:
+        app.logger.exception("Brevo password-reset request failed due to a network/timeout error.")
+        raise RuntimeError("Brevo request failed") from exc
+    if not response.ok:
+        # Log the provider's diagnostic response, but never log API keys or reset links.
+        app.logger.error("Brevo password-reset API rejected the request: HTTP %s; response=%s",
+                         response.status_code, response.text[:500])
+        raise RuntimeError(f"Brevo email API returned HTTP {response.status_code}")
+    app.logger.info("Brevo accepted a password-reset email request (HTTP %s).", response.status_code)
 
 def base_template(content):
     return r"""
@@ -272,6 +339,8 @@ HOME_CONTENT = r"""
 <section class="panel"><h2>Search and filter</h2><form method="get" class="row"><input style="flex:2" name="q" value="{{ query }}" placeholder="Search log text"><select style="flex:1" name="level"><option value="ALL" {% if level=='ALL' %}selected{% endif %}>All levels</option><option value="ERROR" {% if level=='ERROR' %}selected{% endif %}>Errors</option><option value="WARNING" {% if level=='WARNING' %}selected{% endif %}>Warnings</option><option value="INFO" {% if level=='INFO' %}selected{% endif %}>Info</option></select><button>Apply</button></form>
 <p class="muted">Showing {{ shown }} of {{ stats.total }} lines.</p>
 {% for item in logs %}<div class="log {{ item.kind }}">{{ item.text }}</div>{% else %}<p class="muted">No matching lines.</p>{% endfor %}
+{% if advice %}<section class="panel"><h2>Automatic explanations and suggested fixes</h2><p class="muted">These are general troubleshooting suggestions based on matching text in your logs. Confirm the cause before changing a production system.</p>
+{% for item in advice %}<div class="card" style="margin:10px 0"><strong>{{ item.title }}</strong><p>{{ item.explanation }}</p><strong>Suggested checks</strong><ul>{% for step in item.steps %}<li>{{ step }}</li>{% endfor %}</ul><p class="muted">Matched log: {{ item.line }}</p></div>{% endfor %}</section>{% endif %}
 {% if is_pro %}<a class="button green" href="/report.csv">Download CSV report</a>{% else %}<p class="muted">CSV export is a Pro feature. <a href="/pricing">Upgrade to Pro</a>.</p>{% endif %}
 </section>{% endif %}
 """
@@ -294,11 +363,17 @@ def home():
                     flash("File too large. Maximum size is 2 MB.", "error")
                 else:
                     raw_lines = content.decode("utf-8", errors="replace").splitlines()
-                    session["last_upload_lines"] = raw_lines
-                    session["last_upload_name"] = filename
+                    clean_analyses()
+                    analysis_id = secrets.token_urlsafe(24)
+                    with ANALYSES_LOCK:
+                        ANALYSES[analysis_id] = {"lines": raw_lines, "filename": filename, "created": time.monotonic()}
+                    session.pop("last_upload_lines", None)
+                    session.pop("last_upload_name", None)
+                    session["last_analysis_id"] = analysis_id
                     flash(f"Loaded {len(raw_lines)} lines from {filename}.", "success")
                     return redirect(url_for("home"))
-    raw_lines = session.get("last_upload_lines")
+    analysis = get_last_analysis()
+    raw_lines = analysis["lines"] if analysis else None
     analyzed = raw_lines is not None
     if not analyzed:
         return render_template_string(base_template(HOME_CONTENT), title="Log Analyzer Pro", analyzed=False,
@@ -313,6 +388,43 @@ def home():
     counts = [classify(x) for x in raw_lines]
     stats = {"total": len(raw_lines), "errors": counts.count("errorline"), "warnings": counts.count("warningline"),
              "info_other": counts.count("infoline") + counts.count("otherline")}
+
+    # Rule-based guidance: no external AI service or log data sharing required.
+    advice = []
+    guidance_rules = [
+        (r"database connection failed|could not connect to database|connection refused.*database",
+         "Database connection problem",
+         "The application could not establish a connection to its database. Common causes include an unavailable database, incorrect connection settings, or a network/access issue.",
+         ["Confirm the database service is running.", "Check the host, port, database name, and environment variables without exposing passwords.", "Check network access and database permissions.", "Review nearby log entries for the underlying error."]),
+        (r"memory usage is high|out of memory|memoryerror|oomkilled",
+         "High memory usage",
+         "The process may be running low on available memory or using more memory than expected.",
+         ["Check current memory usage and recent changes in workload.", "Look for repeated tasks or unusually large files/requests.", "Review system/container memory limits and restart history.", "Avoid increasing limits until you understand the cause."]),
+        (r"login failed|authentication failed|invalid password|unauthorized|401\b",
+         "Login or authentication failure",
+         "A login or authenticated request was rejected. This may be caused by incorrect credentials, expired sessions, or access rules.",
+         ["Check the timestamp and whether the attempt was expected.", "Verify the login flow and account status.", "Check authentication configuration and session expiry.", "Do not put passwords, tokens, or other secrets in logs."]),
+        (r"permission denied|forbidden|access denied|403\b",
+         "Permission or access problem",
+         "The application attempted to access a resource without sufficient permission.",
+         ["Check the user or service account permissions.", "Confirm file, folder, API, or database access rules.", "Verify the request is using the intended account."]),
+        (r"timeout|timed out|deadline exceeded",
+         "Timeout",
+         "An operation took longer than the allowed time or did not respond in time.",
+         ["Check whether the dependent service is healthy.", "Review network latency and response times.", "Look for slow database queries or overloaded services.", "Only adjust timeout settings after identifying the slow operation."]),
+        (r"file not found|no such file or directory|filenotfounderror",
+         "File not found",
+         "The application could not find a file or path it expected.",
+         ["Check that the file exists at the expected path.", "Check spelling, working directory, and file permissions.", "Confirm the file is included in the deployed environment."]),
+    ]
+    for line in raw_lines:
+        upper_line = line.upper()
+        if classify(line) not in {"errorline", "warningline"}:
+            continue
+        for pattern, title, explanation, steps in guidance_rules:
+            if re.search(pattern, line, re.IGNORECASE):
+                advice.append({"title": title, "explanation": explanation, "steps": steps, "line": line[:500]})
+                break
     query = request.args.get("q", "").strip()[:200]
     level = request.args.get("level", "ALL").upper()
     if level not in {"ALL", "ERROR", "WARNING", "INFO"}: level = "ALL"
@@ -323,14 +435,14 @@ def home():
         if (level == "ALL" or kind_to_level[kind] == level) and query.lower() in line.lower():
             logs.append({"text": line, "kind": kind})
     return render_template_string(base_template(HOME_CONTENT), title="Log Analyzer Pro", analyzed=True,
-                                  stats=stats, logs=logs, shown=len(logs), query=query, level=level)
+                                  stats=stats, logs=logs, shown=len(logs), query=query, level=level, advice=advice)
 
 AUTH_CONTENT = r"""
 <section class="panel" style="max-width:520px;margin:25px auto"><h2>{{ heading }}</h2><p class="muted">{{ helper }}</p>
 <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 <label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
 <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="{{ autocomplete }}" minlength="10" required>
-<button type="submit">{{ action }}</button></form><p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>
+<button type="submit">{{ action }}</button></form>{% if title == "Log in" %}<p><a href="{{ url_for('forgot_password') }}">Forgot password?</a></p>{% endif %}<p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>
 """
 
 @app.route("/register", methods=["GET", "POST"])
@@ -384,102 +496,75 @@ def login():
             session["csrf_token"] = secrets.token_urlsafe(32)
             return redirect(url_for("account"))
         flash("Email or password is incorrect.", "error")
-    login_content = AUTH_CONTENT.replace(
-        '<p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>',
-        '<p class="muted"><a href="/forgot-password">Forgot your password?</a></p><p class="muted">{{ switch_text }} <a href="{{ switch_url }}">{{ switch_label }}</a></p></section>'
-    )
-    return render_template_string(base_template(login_content), title="Log in", heading="Welcome back",
+    return render_template_string(base_template(AUTH_CONTENT), title="Log in", heading="Welcome back",
         helper="Log in to view your account and Pro access.", action="Log in", autocomplete="current-password",
         switch_text="New here?", switch_url=url_for("register"), switch_label="Create account")
 
+
+FORGOT_CONTENT = r"""
+<section class="panel" style="max-width:520px;margin:25px auto"><h2>Forgot your password?</h2>
+<p class="muted">Enter the email address associated with your account. If it exists, we will send a reset link.</p>
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
+<button type="submit">Send reset link</button></form><p><a href="{{ url_for('login') }}">Back to log in</a></p></section>
+"""
+
+RESET_CONTENT = r"""
+<section class="panel" style="max-width:520px;margin:25px auto"><h2>Choose a new password</h2>
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label for="password">New password</label><input id="password" name="password" type="password" autocomplete="new-password" minlength="10" required>
+<label for="confirm_password">Confirm new password</label><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
+<button type="submit">Reset password</button></form></section>
+"""
+
 @app.route("/forgot-password", methods=["GET", "POST"])
 def forgot_password():
-    content = r"""
-    <section class="panel" style="max-width:520px;margin:25px auto">
-      <h2>Forgot your password?</h2>
-      <p class="muted">Enter the email address on your account. If it exists, we'll send a reset link.</p>
-      <form method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <label for="email">Email address</label>
-        <input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
-        <button type="submit">Send reset link</button>
-      </form>
-      <p class="muted"><a href="{{ url_for('login') }}">Back to log in</a></p>
-    </section>
-    """
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
-        # Always show the same response to avoid revealing registered accounts.
-        generic_message = "If an account exists for that email, a password-reset link will be sent."
-        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) and len(email) <= 254:
-            conn, kind = db_connection()
-            try:
-                row = db_execute(conn, kind, "SELECT id, email FROM users WHERE email = ?", (email,)).fetchone()
-                if row:
-                    raw_token = secrets.token_urlsafe(32)
-                    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-                    now = utc_now()
-                    expires = now + timedelta(minutes=30)
-                    db_execute(conn, kind,
-                        "UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
-                        (iso(now), row["id"]))
-                    db_execute(conn, kind, """
-                        INSERT INTO password_resets(user_id, token_hash, expires_at, created_at)
-                        VALUES(?,?,?,?)
-                    """, (row["id"], token_hash, iso(expires), iso(now)))
-                    conn.commit()
-                    base_url = public_base_url()
-                    if not BREVO_API_KEY or not BREVO_SENDER_EMAIL or not base_url:
-                        app.logger.error("Password reset email not configured: set BREVO_API_KEY, BREVO_SENDER_EMAIL, and APP_BASE_URL or RENDER_EXTERNAL_URL")
-                    else:
-                        reset_url = base_url + url_for("reset_password", token=raw_token)
-                        payload = {
-                            "sender": {"email": BREVO_SENDER_EMAIL, "name": "Log Analyzer Pro"},
-                            "to": [{"email": row["email"]}],
-                            "subject": "Reset your Log Analyzer Pro password",
-                            "textContent": (
-                                "We received a request to reset your Log Analyzer Pro password. "
-                                "Use this link within 30 minutes: " + reset_url +
-                                "\n\nIf you did not request this, you can ignore this email."
-                            ),
-                        }
-                        try:
-                            response = requests.post(
-                                "https://api.brevo.com/v3/smtp/email",
-                                headers={"api-key": BREVO_API_KEY, "accept": "application/json",
-                                         "content-type": "application/json"},
-                                json=payload, timeout=15)
-                            if not response.ok:
-                                app.logger.error("Brevo password reset email failed: status=%s response=%s",
-                                                 response.status_code, response.text[:500])
-                        except requests.RequestException:
-                            app.logger.exception("Brevo password reset email request failed")
-            except Exception:
-                conn.rollback()
-                app.logger.exception("Could not create password reset request")
-            finally:
-                conn.close()
-        flash(generic_message, "success")
-        return redirect(url_for("forgot_password"))
-    return render_template_string(base_template(content), title="Forgot password")
+        # Use a generic message so the page does not reveal whether an account exists.
+        generic = "If an account matches that email and email delivery is configured, a reset link will be sent shortly."
+        app.logger.info("Password-reset request received.")
+        conn, kind = db_connection()
+        try:
+            user = db_execute(conn, kind, "SELECT id,email FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
+            app.logger.info("Password-reset account lookup completed; matching account found=%s.", bool(user))
+            if user:
+                token = secrets.token_urlsafe(32)
+                token_hash = hashlib.sha256(token.encode()).hexdigest()
+                expires = iso(utc_now() + timedelta(minutes=30))
+                db_execute(conn, kind, "INSERT INTO password_reset_tokens(token_hash,user_id,expires_at,used_at,created_at) VALUES(?,?,?,?,?)",
+                           (token_hash, user["id"], expires, None, iso(utc_now())))
+                conn.commit()
+                reset_url = urljoin(APP_BASE_URL + "/", "reset-password/" + token)
+                try:
+                    send_reset_email(user["email"], reset_url)
+                except Exception:
+                    app.logger.exception("Password-reset email delivery failed. Check the Brevo sender, API key, and Brevo transactional email status in Render/Brevo.")
+                    # Do not reveal account existence or the token to the browser.
+        except Exception:
+            app.logger.exception("Password-reset database operation failed.")
+            flash("We could not process the request right now. Please try again later.", "error")
+            return redirect(url_for("forgot_password"))
+        finally:
+            conn.close()
+        flash(generic, "success")
+        return redirect(url_for("login"))
+    return render_template_string(base_template(FORGOT_CONTENT), title="Forgot password")
 
 @app.route("/reset-password/<token>", methods=["GET", "POST"])
 def reset_password(token):
     if not token or len(token) > 200:
-        flash("That password-reset link is invalid or expired. Request a new one.", "error")
-        return redirect(url_for("forgot_password"))
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        abort(404)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
     conn, kind = db_connection()
     try:
-        row = db_execute(conn, kind, """
-            SELECT id, user_id, expires_at, used_at FROM password_resets
-            WHERE token_hash = ?
-        """, (token_hash,)).fetchone()
-        valid = bool(row and not row["used_at"] and parse_dt(row["expires_at"]) and
-                     parse_dt(row["expires_at"]) > utc_now())
+        reset = db_execute(conn, kind, "SELECT token_hash,user_id,expires_at,used_at FROM password_reset_tokens WHERE token_hash = ?", (token_hash,)).fetchone()
+        valid = bool(reset and not reset["used_at"] and parse_dt(reset["expires_at"]) and parse_dt(reset["expires_at"]) > utc_now())
         if not valid:
-            flash("That password-reset link is invalid or expired. Request a new one.", "error")
-            return redirect(url_for("forgot_password"))
+            if request.method == "GET":
+                flash("That password reset link is invalid, expired, or already used. Request a new one.", "error")
+                return redirect(url_for("forgot_password"))
+            abort(400)
         if request.method == "POST":
             password = request.form.get("password", "")
             confirm = request.form.get("confirm_password", "")
@@ -488,32 +573,14 @@ def reset_password(token):
             elif password != confirm:
                 flash("The passwords do not match.", "error")
             else:
-                now = iso(utc_now())
-                db_execute(conn, kind, "UPDATE users SET password_hash = ? WHERE id = ?",
-                           (generate_password_hash(password), row["user_id"]))
-                db_execute(conn, kind, "UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
-                           (now, row["user_id"]))
+                db_execute(conn, kind, "UPDATE users SET password_hash = ? WHERE id = ?", (generate_password_hash(password), reset["user_id"]))
+                db_execute(conn, kind, "UPDATE password_reset_tokens SET used_at = ? WHERE token_hash = ?", (iso(utc_now()), token_hash))
                 conn.commit()
-                session.clear()
                 flash("Your password has been reset. Please log in with your new password.", "success")
                 return redirect(url_for("login"))
     finally:
         conn.close()
-    content = r"""
-    <section class="panel" style="max-width:520px;margin:25px auto">
-      <h2>Choose a new password</h2>
-      <p class="muted">Use at least 10 characters.</p>
-      <form method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <label for="password">New password</label>
-        <input id="password" name="password" type="password" autocomplete="new-password" minlength="10" required>
-        <label for="confirm_password">Confirm new password</label>
-        <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
-        <button type="submit">Reset password</button>
-      </form>
-    </section>
-    """
-    return render_template_string(base_template(content), title="Reset password")
+    return render_template_string(base_template(RESET_CONTENT), title="Reset password")
 
 @app.route("/logout", methods=["POST"])
 def logout():
@@ -732,9 +799,10 @@ def download_report():
     if not active_pro(session.get("user_id")):
         flash("CSV export is available on Pro. Choose a plan to unlock it.", "error")
         return redirect(url_for("pricing"))
-    lines = session.get("last_upload_lines")
+    analysis = get_last_analysis()
+    lines = analysis["lines"] if analysis else None
     if lines is None:
-        flash("Upload a log file before downloading a report.", "error")
+        flash("Upload a log file before downloading a report. Analyses expire after 30 minutes or a server restart.", "error")
         return redirect(url_for("home"))
     output = io.StringIO()
     writer = csv.writer(output)
