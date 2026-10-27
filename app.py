@@ -116,6 +116,18 @@ def init_db():
                 )
             """)
             db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id),
+                    subscription_code TEXT UNIQUE NOT NULL,
+                    plan_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    next_payment_date TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            db_execute(conn, kind, """
                 CREATE TABLE IF NOT EXISTS password_reset_tokens (
                     token_hash TEXT PRIMARY KEY,
                     user_id BIGINT NOT NULL REFERENCES users(id),
@@ -145,6 +157,18 @@ def init_db():
                     paid_at TEXT,
                     expires_at TEXT,
                     created_at TEXT NOT NULL
+                )
+            """)
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    subscription_code TEXT UNIQUE NOT NULL,
+                    plan_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    next_payment_date TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
             """)
             db_execute(conn, kind, """
@@ -615,19 +639,68 @@ def account():
             FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 20
         """, (user["id"],)).fetchall()
         payments = [dict(x) for x in rows]
+        sub_row = db_execute(conn, kind, """
+            SELECT subscription_code, plan_key, status, next_payment_date
+            FROM subscriptions WHERE user_id = ?
+            ORDER BY updated_at DESC LIMIT 1
+        """, (user["id"],)).fetchone()
+        subscription = dict(sub_row) if sub_row else None
     finally:
         conn.close()
     content = r"""
 <section class="panel"><h2>Your account</h2><p>Email: <strong>{{ user.email }}</strong></p>
 {% if is_pro %}<div class="notice">Your Pro access is active.</div>{% else %}<p>Your account is currently on the Free plan.</p><a class="button green" href="/pricing">View Pro plans</a>{% endif %}</section>
+{% if subscription %}<section class="panel"><h2>Subscription</h2><p>Status: <strong>{{ subscription.status|replace('-', ' ')|title }}</strong></p>
+{% if subscription.next_payment_date %}<p class="muted">Next payment date: {{ subscription.next_payment_date }}</p>{% endif %}
+{% if subscription.status in ['active', 'non-renewing', 'attention'] %}<a class="button secondary" href="{{ url_for('manage_subscription') }}">Manage or cancel subscription</a>{% endif %}
+<p class="muted">If you cancel, your Pro access remains available until the paid period ends.</p></section>{% endif %}
 <section class="panel"><h2>Payment history</h2>{% if payments %}<div style="overflow-x:auto"><table><thead><tr><th>Plan</th><th>Amount</th><th>Status</th><th>Paid at</th><th>Expires</th></tr></thead><tbody>{% for p in payments %}<tr><td>{{ plans[p.plan_key].name if p.plan_key in plans else p.plan_key }}</td><td>{{ p.currency }} {{ '%.2f'|format(p.amount/100) }}</td><td>{{ p.status }}</td><td>{{ p.paid_at or '—' }}</td><td>{{ p.expires_at or '—' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No payments yet.</p>{% endif %}</section>
 """
-    return render_template_string(base_template(content), title="Your account", user=user, payments=payments)
+    return render_template_string(base_template(content), title="Your account", user=user, payments=payments, subscription=subscription)
 
 def paystack_headers():
     if not PAYSTACK_SECRET_KEY:
         raise RuntimeError("PAYSTACK_SECRET_KEY is not configured")
     return {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
+
+@app.route("/subscription/manage")
+@login_required
+def manage_subscription():
+    """Redirect the signed-in customer to Paystack's secure subscription manager."""
+    if not PAYSTACK_SECRET_KEY:
+        flash("Subscription management is temporarily unavailable. Please try again later.", "error")
+        return redirect(url_for("account"))
+    user = current_user()
+    conn, kind = db_connection()
+    try:
+        row = db_execute(conn, kind, """
+            SELECT subscription_code FROM subscriptions
+            WHERE user_id = ? AND status IN ('active', 'non-renewing', 'attention')
+            ORDER BY updated_at DESC LIMIT 1
+        """, (user["id"],)).fetchone()
+        subscription_code = row["subscription_code"] if row else None
+    finally:
+        conn.close()
+    if not subscription_code:
+        flash("No manageable subscription was found for your account yet.", "error")
+        return redirect(url_for("account"))
+    try:
+        response = requests.get(
+            PAYSTACK_BASE_URL + "/subscription/" + requests.utils.quote(subscription_code, safe="") + "/manage/link",
+            headers=paystack_headers(), timeout=20,
+        )
+        result = response.json() if response.content else {}
+        link = (result.get("data") or {}).get("link") if isinstance(result, dict) else None
+        if not response.ok or not result.get("status") or not link or not link.startswith("https://paystack.com/"):
+            app.logger.warning("Paystack subscription management link failed: status=%s", response.status_code)
+            flash("Paystack could not open subscription management. Please try again later.", "error")
+            return redirect(url_for("account"))
+        return redirect(link)
+    except (requests.RequestException, ValueError, RuntimeError):
+        app.logger.exception("Subscription management link request failed")
+        flash("We couldn't reach Paystack to manage your subscription. Please try again later.", "error")
+        return redirect(url_for("account"))
+
 
 def public_base_url():
     if APP_BASE_URL:
@@ -718,7 +791,14 @@ def apply_verified_payment(reference, verified):
         return False, "Payment is not marked successful by Paystack."
     conn, kind = db_connection()
     try:
-        row = db_execute(conn, kind, "SELECT * FROM payments WHERE reference = ?", (reference,)).fetchone()
+        # Serialize duplicate deliveries for the same payment. SQLite's immediate
+        # transaction also serializes writers; PostgreSQL locks the payment row.
+        if kind == "sqlite":
+            conn.execute("BEGIN IMMEDIATE")
+        row_sql = "SELECT * FROM payments WHERE reference = ?"
+        if kind == "postgres":
+            row_sql += " FOR UPDATE"
+        row = db_execute(conn, kind, row_sql, (reference,)).fetchone()
         if not row:
             app.logger.warning("Verified Paystack reference has no matching local payment")
             return False, "We couldn't match this payment to an order."
@@ -726,17 +806,25 @@ def apply_verified_payment(reference, verified):
         plan = PLANS.get(payment["plan_key"])
         if not plan:
             return False, "The selected plan is invalid."
-        # Validate amount, currency, and reference before granting access.
         if str(verified.get("reference", "")) != reference:
             return False, "Payment reference did not match."
-        if int(verified.get("amount", -1)) != int(payment["amount"]):
+        try:
+            verified_amount = int(verified.get("amount", -1))
+        except (TypeError, ValueError):
+            verified_amount = -1
+        if verified_amount != int(payment["amount"]):
             app.logger.warning("Paystack amount mismatch for reference %s", reference)
             return False, "The payment amount did not match the selected plan."
         if verified.get("currency") != payment["currency"]:
             app.logger.warning("Paystack currency mismatch for reference %s", reference)
             return False, "The payment currency did not match the selected plan."
         if payment["status"] == "success":
+            conn.commit()
             return True, "Payment already verified."
+        if kind == "postgres":
+            # Lock the customer row too, so separate successful payments cannot
+            # calculate overlapping Pro expiry periods for the same account.
+            db_execute(conn, kind, "SELECT id FROM users WHERE id = ? FOR UPDATE", (payment["user_id"],)).fetchone()
         now = utc_now()
         existing_expiry_row = db_execute(conn, kind, """
             SELECT expires_at FROM payments WHERE user_id = ? AND status = 'success'
@@ -757,6 +845,7 @@ def apply_verified_payment(reference, verified):
     finally:
         conn.close()
 
+
 @app.route("/payment/callback")
 @login_required
 def payment_callback():
@@ -776,8 +865,113 @@ def payment_callback():
         flash("Payment verification is temporarily unavailable.", "error")
     return redirect(url_for("account"))
 
-def apply_recurring_renewal(reference, verified):
-    """Record a successful recurring renewal when its reference was not the first checkout."""
+
+def _plan_key_from_payload(*objects):
+    """Identify one of this app's plans from Paystack's plan code or amount/currency."""
+    plan_code = None
+    amount = None
+    currency = None
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        plan = obj.get("plan") or obj.get("plan_object")
+        if isinstance(plan, dict):
+            plan_code = plan_code or plan.get("plan_code")
+            amount = amount if amount is not None else plan.get("amount")
+            currency = currency or plan.get("currency")
+        elif isinstance(plan, str):
+            plan_code = plan_code or plan
+        if not plan_code:
+            plan_code = obj.get("plan_code")
+        if amount is None and obj.get("amount") is not None:
+            amount = obj.get("amount")
+        currency = currency or obj.get("currency")
+    for key, plan in PLANS.items():
+        if plan_code and str(plan.get("paystack_plan_code")) == str(plan_code):
+            return key
+    try:
+        amount_int = int(amount) if amount is not None else None
+    except (TypeError, ValueError):
+        amount_int = None
+    matches = [key for key, plan in PLANS.items()
+               if amount_int == int(plan["amount"]) and currency == plan["currency"]]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _customer_email_from_payload(*objects):
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        customer = obj.get("customer")
+        if isinstance(customer, dict):
+            email = customer.get("email")
+            if isinstance(email, str) and email.strip():
+                return email.strip().lower()
+        email = obj.get("email")
+        if isinstance(email, str) and email.strip():
+            return email.strip().lower()
+    return ""
+
+
+def process_subscription_event(event_name, data):
+    """Store subscription lifecycle status without removing already-paid access."""
+    if not isinstance(data, dict):
+        return False
+    subscription_obj = data.get("subscription") if isinstance(data.get("subscription"), dict) else {}
+    plan_obj = data.get("plan") if isinstance(data.get("plan"), dict) else {}
+    email = _customer_email_from_payload(data, subscription_obj)
+    subscription_code = (data.get("subscription_code") or subscription_obj.get("subscription_code") or "").strip()
+    plan_key = _plan_key_from_payload(data, subscription_obj, plan_obj)
+    if not subscription_code:
+        app.logger.warning("Paystack subscription event %s had no subscription code", event_name)
+        return False
+
+    status_by_event = {
+        "subscription.create": data.get("status") or "active",
+        "subscription.not_renew": "non-renewing",
+        "subscription.disable": data.get("status") or "disabled",
+        "invoice.payment_failed": "attention",
+    }
+    status = str(status_by_event.get(event_name, data.get("status") or "unknown")).lower()
+    next_payment_date = data.get("next_payment_date") or subscription_obj.get("next_payment_date")
+    conn, kind = db_connection()
+    try:
+        existing = db_execute(conn, kind, "SELECT id FROM subscriptions WHERE subscription_code = ?", (subscription_code,)).fetchone()
+        if existing:
+            db_execute(conn, kind, """
+                UPDATE subscriptions SET status=?, next_payment_date=?, updated_at=?
+                WHERE subscription_code=?
+            """, (status, next_payment_date, iso(utc_now()), subscription_code))
+            conn.commit()
+            return True
+        if not email:
+            app.logger.warning("Paystack subscription event %s had no customer email for an unknown subscription", event_name)
+            return False
+        user = db_execute(conn, kind, "SELECT id FROM users WHERE LOWER(email)=?", (email,)).fetchone()
+        if not user:
+            app.logger.warning("Paystack subscription email did not match a Log Analyzer Pro user")
+            return False
+        if not plan_key:
+            # Do not guess the plan if neither plan code nor unique amount identifies it.
+            app.logger.warning("Paystack subscription event %s could not be matched to a configured plan", event_name)
+            return False
+        now = iso(utc_now())
+        db_execute(conn, kind, """
+            INSERT INTO subscriptions(user_id,subscription_code,plan_key,status,next_payment_date,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?)
+        """, (user["id"], subscription_code, plan_key, status, next_payment_date, now, now))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        app.logger.exception("Could not record Paystack subscription event %s", event_name)
+        return False
+    finally:
+        conn.close()
+
+
+def apply_recurring_renewal(reference, verified, event_data=None):
+    """Record only a server-verified renewal, safely handling retries and concurrent events."""
     if not verified or verified.get("status") != "success":
         return False
     if str(verified.get("reference", "")) != reference:
@@ -787,35 +981,31 @@ def apply_recurring_renewal(reference, verified):
     except (TypeError, ValueError):
         return False
     currency = verified.get("currency")
-    # Map renewals only to one of our configured Paystack plan codes and expected prices.
-    plan_code = verified.get("plan")
-    if isinstance(plan_code, dict):
-        plan_code = plan_code.get("plan_code") or plan_code.get("id")
-    plan_object = verified.get("plan_object") or {}
-    if not plan_code and isinstance(plan_object, dict):
-        plan_code = plan_object.get("plan_code")
-    plan_key = next((key for key, value in PLANS.items()
-                     if value.get("paystack_plan_code") == str(plan_code)
-                     and int(value["amount"]) == amount
-                     and value["currency"] == currency), None)
-    if not plan_key:
-        app.logger.info("Recurring charge %s was not matched to a configured plan; no access granted", reference)
+    event_data = event_data if isinstance(event_data, dict) else {}
+    plan_key = _plan_key_from_payload(verified, event_data)
+    if not plan_key or int(PLANS[plan_key]["amount"]) != amount or PLANS[plan_key]["currency"] != currency:
+        app.logger.info("Recurring charge %s did not match a configured plan; no access granted", reference)
         return False
-    customer = verified.get("customer") or {}
-    email = customer.get("email", "").strip().lower() if isinstance(customer, dict) else ""
+    email = _customer_email_from_payload(verified, event_data)
     if not email:
         return False
+
     conn, kind = db_connection()
     try:
+        if kind == "sqlite":
+            conn.execute("BEGIN IMMEDIATE")
         existing = db_execute(conn, kind, "SELECT status FROM payments WHERE reference = ?", (reference,)).fetchone()
         if existing:
-            # A webhook can be retried. Never extend access twice for the same reference.
+            conn.commit()
             return existing["status"] == "success"
         user_row = db_execute(conn, kind, "SELECT id FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
         if not user_row:
             app.logger.warning("Recurring Paystack payment email did not match a Log Analyzer Pro user")
             return False
         user_id = user_row["id"]
+        if kind == "postgres":
+            # Serializes separate renewal references for the same customer so expiry periods cannot overlap.
+            db_execute(conn, kind, "SELECT id FROM users WHERE id = ? FOR UPDATE", (user_id,)).fetchone()
         now = utc_now()
         last = db_execute(conn, kind, """
             SELECT expires_at FROM payments WHERE user_id = ? AND status = 'success'
@@ -833,14 +1023,21 @@ def apply_recurring_renewal(reference, verified):
         return True
     except Exception:
         conn.rollback()
+        # A unique-reference conflict means another delivery already recorded it.
+        try:
+            existing = db_execute(conn, kind, "SELECT status FROM payments WHERE reference = ?", (reference,)).fetchone()
+            if existing and existing["status"] == "success":
+                return True
+        except Exception:
+            pass
         app.logger.exception("Could not record recurring Paystack renewal")
         return False
     finally:
         conn.close()
 
+
 @app.route("/paystack/webhook", methods=["POST"])
 def paystack_webhook():
-    # Verify Paystack's HMAC signature using the secret key before trusting the event.
     if not PAYSTACK_SECRET_KEY:
         abort(503)
     signature = request.headers.get("x-paystack-signature", "")
@@ -852,28 +1049,38 @@ def paystack_webhook():
         event = json.loads(raw_body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         abort(400)
-    if event.get("event") == "charge.success":
-        data = event.get("data") or {}
-        reference = data.get("reference", "")
+    event_name = event.get("event") if isinstance(event, dict) else None
+    data = event.get("data") if isinstance(event, dict) else None
+    if not isinstance(data, dict):
+        return "OK", 200
+
+    if event_name == "charge.success":
+        reference = str(data.get("reference") or "").strip()
         if reference:
             try:
                 verified = verify_paystack(reference)
-                # First checkout references already exist in our payments table.
-                # Renewal references are new, so record them separately after verification.
                 if verified:
-                    existing = None
                     conn, kind = db_connection()
                     try:
                         existing = db_execute(conn, kind, "SELECT reference FROM payments WHERE reference = ?", (reference,)).fetchone()
                     finally:
                         conn.close()
                     if existing:
-                        apply_verified_payment(reference, verified)
+                        ok, _message = apply_verified_payment(reference, verified)
+                        if not ok:
+                            app.logger.warning("Verified first-payment event was not applied for reference %s", reference)
                     else:
-                        apply_recurring_renewal(reference, verified)
+                        apply_recurring_renewal(reference, verified, data)
+            except (requests.RequestException, RuntimeError):
+                app.logger.exception("Paystack charge verification failed; webhook will be retried")
+                return "Temporary processing error", 500
             except Exception:
                 app.logger.exception("Webhook payment processing failed")
                 return "Temporary processing error", 500
+    elif event_name in {"subscription.create", "subscription.not_renew", "subscription.disable", "invoice.payment_failed"}:
+        if not process_subscription_event(event_name, data):
+            # Avoid infinite retries for unrelated/unknown customer events; log the mismatch for review.
+            app.logger.warning("Subscription webhook event %s was not linked to a local subscription", event_name)
     return "OK", 200
 
 @app.route("/report.csv")
