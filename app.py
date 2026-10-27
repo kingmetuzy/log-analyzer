@@ -25,6 +25,8 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "")
 if not app.secret_key:
     # Development fallback only. Set SECRET_KEY in Render for stable secure sessions.
+    if os.environ.get("RENDER"):
+        raise RuntimeError("SECRET_KEY must be configured in the Render environment")
     app.secret_key = secrets.token_hex(32)
 
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
@@ -70,11 +72,18 @@ PRO_FEATURES = [
 # This app supports PostgreSQL via DATABASE_URL or SQLite locally.
 # For Render production, use a managed PostgreSQL database for durable user/payment records.
 def db_connection():
-    if DATABASE_URL.startswith(("postgres://", "postgresql://")):
+    # Never silently fall back to a fresh SQLite file in production: that can make
+    # existing accounts appear missing and make password changes seem not to persist.
+    database_url = DATABASE_URL.strip()
+    if database_url.startswith(("postgres://", "postgresql://")):
         import psycopg
         from psycopg.rows import dict_row
-        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        conn = psycopg.connect(database_url, row_factory=dict_row)
         return conn, "postgres"
+    if database_url:
+        raise RuntimeError("DATABASE_URL must use postgres:// or postgresql://")
+    if os.environ.get("RENDER"):
+        raise RuntimeError("DATABASE_URL is required on Render; refusing to use temporary SQLite storage")
     path = os.environ.get("SQLITE_PATH", "log_analyzer.db")
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -458,6 +467,10 @@ def register():
         else:
             conn, kind = db_connection()
             try:
+                existing = db_execute(conn, kind, "SELECT id FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
+                if existing:
+                    flash("An account with that email already exists. Please log in or use Forgot password.", "error")
+                    return redirect(url_for("login"))
                 db_execute(conn, kind, "INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)",
                            (email, generate_password_hash(password), iso(utc_now())))
                 conn.commit()
@@ -487,7 +500,7 @@ def login():
         password = request.form.get("password", "")
         conn, kind = db_connection()
         try:
-            row = db_execute(conn, kind, "SELECT id,email,password_hash FROM users WHERE email = ?", (email,)).fetchone()
+            row = db_execute(conn, kind, "SELECT id,email,password_hash FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
         finally:
             conn.close()
         if row and check_password_hash(row["password_hash"], password):
@@ -523,7 +536,7 @@ def forgot_password():
         email = request.form.get("email", "").strip().lower()
         # Use a generic message so the page does not reveal whether an account exists.
         generic = "If an account matches that email and email delivery is configured, a reset link will be sent shortly."
-        app.logger.info("Password-reset request received.")
+        app.logger.info("Password-reset request received; database backend=%s.", "postgres" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite")
         conn, kind = db_connection()
         try:
             user = db_execute(conn, kind, "SELECT id,email FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
@@ -541,6 +554,8 @@ def forgot_password():
                 except Exception:
                     app.logger.exception("Password-reset email delivery failed. Check the Brevo sender, API key, and Brevo transactional email status in Render/Brevo.")
                     # Do not reveal account existence or the token to the browser.
+            else:
+                app.logger.warning("No account matched the password-reset request in the configured database; no email was sent.")
         except Exception:
             app.logger.exception("Password-reset database operation failed.")
             flash("We could not process the request right now. Please try again later.", "error")
