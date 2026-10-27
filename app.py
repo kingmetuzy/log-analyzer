@@ -50,7 +50,7 @@ PLANS = {
         "name": "Pro Monthly", "amount": 1_500_000, "currency": "NGN",
         "duration_days": 30, "display": "₦15,000 / month",
         # Public Paystack plan code (not a secret key).
-        "paystack_plan_code": "PLN_qg6mx0wgfe9q5zz",
+        "paystack_plan_code": "PLN_gq6mx0wgfe9q5zz",
     },
     "yearly": {
         "name": "Pro Yearly", "amount": 15_000_000, "currency": "NGN",
