@@ -25,8 +25,6 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "")
 if not app.secret_key:
     # Development fallback only. Set SECRET_KEY in Render for stable secure sessions.
-    if os.environ.get("RENDER"):
-        raise RuntimeError("SECRET_KEY must be configured in the Render environment")
     app.secret_key = secrets.token_hex(32)
 
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
@@ -51,10 +49,14 @@ PLANS = {
     "monthly": {
         "name": "Pro Monthly", "amount": 1_500_000, "currency": "NGN",
         "duration_days": 30, "display": "₦15,000 / month",
+        # Public Paystack plan code (not a secret key).
+        "paystack_plan_code": "PLN_qg6mx0wgfe9q5zz",
     },
     "yearly": {
         "name": "Pro Yearly", "amount": 15_000_000, "currency": "NGN",
         "duration_days": 365, "display": "₦150,000 / year",
+        # Public Paystack plan code (not a secret key).
+        "paystack_plan_code": "PLN_8y8phcju2t310ia",
     },
 }
 FREE_FEATURES = [
@@ -72,18 +74,11 @@ PRO_FEATURES = [
 # This app supports PostgreSQL via DATABASE_URL or SQLite locally.
 # For Render production, use a managed PostgreSQL database for durable user/payment records.
 def db_connection():
-    # Never silently fall back to a fresh SQLite file in production: that can make
-    # existing accounts appear missing and make password changes seem not to persist.
-    database_url = DATABASE_URL.strip()
-    if database_url.startswith(("postgres://", "postgresql://")):
+    if DATABASE_URL.startswith(("postgres://", "postgresql://")):
         import psycopg
         from psycopg.rows import dict_row
-        conn = psycopg.connect(database_url, row_factory=dict_row)
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
         return conn, "postgres"
-    if database_url:
-        raise RuntimeError("DATABASE_URL must use postgres:// or postgresql://")
-    if os.environ.get("RENDER"):
-        raise RuntimeError("DATABASE_URL is required on Render; refusing to use temporary SQLite storage")
     path = os.environ.get("SQLITE_PATH", "log_analyzer.db")
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -467,10 +462,6 @@ def register():
         else:
             conn, kind = db_connection()
             try:
-                existing = db_execute(conn, kind, "SELECT id FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
-                if existing:
-                    flash("An account with that email already exists. Please log in or use Forgot password.", "error")
-                    return redirect(url_for("login"))
                 db_execute(conn, kind, "INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)",
                            (email, generate_password_hash(password), iso(utc_now())))
                 conn.commit()
@@ -500,7 +491,7 @@ def login():
         password = request.form.get("password", "")
         conn, kind = db_connection()
         try:
-            row = db_execute(conn, kind, "SELECT id,email,password_hash FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
+            row = db_execute(conn, kind, "SELECT id,email,password_hash FROM users WHERE email = ?", (email,)).fetchone()
         finally:
             conn.close()
         if row and check_password_hash(row["password_hash"], password):
@@ -536,7 +527,7 @@ def forgot_password():
         email = request.form.get("email", "").strip().lower()
         # Use a generic message so the page does not reveal whether an account exists.
         generic = "If an account matches that email and email delivery is configured, a reset link will be sent shortly."
-        app.logger.info("Password-reset request received; database backend=%s.", "postgres" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite")
+        app.logger.info("Password-reset request received.")
         conn, kind = db_connection()
         try:
             user = db_execute(conn, kind, "SELECT id,email FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
@@ -554,8 +545,6 @@ def forgot_password():
                 except Exception:
                     app.logger.exception("Password-reset email delivery failed. Check the Brevo sender, API key, and Brevo transactional email status in Render/Brevo.")
                     # Do not reveal account existence or the token to the browser.
-            else:
-                app.logger.warning("No account matched the password-reset request in the configured database; no email was sent.")
         except Exception:
             app.logger.exception("Password-reset database operation failed.")
             flash("We could not process the request right now. Please try again later.", "error")
@@ -611,7 +600,7 @@ def pricing():
 {% for key,plan in plans.items() %}<article class="card"><span class="badge">PRO</span><h3 style="margin-top:10px">{{ plan.name }}</h3><div class="price">{{ plan.display }}</div><ul>{% for feature in pro_features %}<li>{{ feature }}</li>{% endfor %}</ul>
 {% if current_user %}<form method="post" action="/checkout/{{ key }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="green" type="submit">Upgrade to {{ plan.name }}</button></form>{% else %}<a class="button green" href="/register">Create account to upgrade</a>{% endif %}
 </article>{% endfor %}</div>
-<p class="muted">Payments are processed by Paystack. Pro access is granted only after server-side payment verification.</p></section>
+<p class="muted">Payments are processed by Paystack. By choosing a Pro plan, you authorize recurring charges of the displayed amount at the displayed interval until you cancel. Pro access is granted only after server-side payment verification. If you cancel, access remains active until the paid period ends.</p></section>
 """
     return render_template_string(base_template(content), title="Pricing")
 
@@ -670,9 +659,14 @@ def checkout(plan_key):
         conn.commit()
     finally:
         conn.close()
+    plan_code = plan.get("paystack_plan_code", "").strip()
+    if not plan_code.startswith("PLN_"):
+        flash("The recurring Paystack plan is not configured correctly. Please try again later.", "error")
+        return redirect(url_for("pricing"))
     payload = {
         "email": user["email"],
         "amount": plan["amount"],
+        "plan": plan_code,
         "currency": plan["currency"],
         "reference": reference,
         "callback_url": urljoin(base_url + "/", "payment/callback"),
@@ -782,6 +776,68 @@ def payment_callback():
         flash("Payment verification is temporarily unavailable.", "error")
     return redirect(url_for("account"))
 
+def apply_recurring_renewal(reference, verified):
+    """Record a successful recurring renewal when its reference was not the first checkout."""
+    if not verified or verified.get("status") != "success":
+        return False
+    if str(verified.get("reference", "")) != reference:
+        return False
+    try:
+        amount = int(verified.get("amount", -1))
+    except (TypeError, ValueError):
+        return False
+    currency = verified.get("currency")
+    # Map renewals only to one of our configured Paystack plan codes and expected prices.
+    plan_code = verified.get("plan")
+    if isinstance(plan_code, dict):
+        plan_code = plan_code.get("plan_code") or plan_code.get("id")
+    plan_object = verified.get("plan_object") or {}
+    if not plan_code and isinstance(plan_object, dict):
+        plan_code = plan_object.get("plan_code")
+    plan_key = next((key for key, value in PLANS.items()
+                     if value.get("paystack_plan_code") == str(plan_code)
+                     and int(value["amount"]) == amount
+                     and value["currency"] == currency), None)
+    if not plan_key:
+        app.logger.info("Recurring charge %s was not matched to a configured plan; no access granted", reference)
+        return False
+    customer = verified.get("customer") or {}
+    email = customer.get("email", "").strip().lower() if isinstance(customer, dict) else ""
+    if not email:
+        return False
+    conn, kind = db_connection()
+    try:
+        existing = db_execute(conn, kind, "SELECT status FROM payments WHERE reference = ?", (reference,)).fetchone()
+        if existing:
+            # A webhook can be retried. Never extend access twice for the same reference.
+            return existing["status"] == "success"
+        user_row = db_execute(conn, kind, "SELECT id FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
+        if not user_row:
+            app.logger.warning("Recurring Paystack payment email did not match a Log Analyzer Pro user")
+            return False
+        user_id = user_row["id"]
+        now = utc_now()
+        last = db_execute(conn, kind, """
+            SELECT expires_at FROM payments WHERE user_id = ? AND status = 'success'
+            ORDER BY expires_at DESC LIMIT 1
+        """, (user_id,)).fetchone()
+        previous_expiry = parse_dt(last["expires_at"]) if last else None
+        start = previous_expiry if previous_expiry and previous_expiry > now else now
+        expires = start + timedelta(days=PLANS[plan_key]["duration_days"])
+        db_execute(conn, kind, """
+            INSERT INTO payments(user_id,reference,plan_key,amount,currency,status,paid_at,expires_at,created_at)
+            VALUES(?,?,?,?,?,'success',?,?,?)
+        """, (user_id, reference, plan_key, amount, currency, iso(now), iso(expires), iso(now)))
+        conn.commit()
+        app.logger.info("Recorded recurring Paystack renewal for user_id=%s plan=%s", user_id, plan_key)
+        return True
+    except Exception:
+        conn.rollback()
+        app.logger.exception("Could not record recurring Paystack renewal")
+        return False
+    finally:
+        conn.close()
+
 @app.route("/paystack/webhook", methods=["POST"])
 def paystack_webhook():
     # Verify Paystack's HMAC signature using the secret key before trusting the event.
@@ -802,7 +858,19 @@ def paystack_webhook():
         if reference:
             try:
                 verified = verify_paystack(reference)
-                apply_verified_payment(reference, verified)
+                # First checkout references already exist in our payments table.
+                # Renewal references are new, so record them separately after verification.
+                if verified:
+                    existing = None
+                    conn, kind = db_connection()
+                    try:
+                        existing = db_execute(conn, kind, "SELECT reference FROM payments WHERE reference = ?", (reference,)).fetchone()
+                    finally:
+                        conn.close()
+                    if existing:
+                        apply_verified_payment(reference, verified)
+                    else:
+                        apply_recurring_renewal(reference, verified)
             except Exception:
                 app.logger.exception("Webhook payment processing failed")
                 return "Temporary processing error", 500
