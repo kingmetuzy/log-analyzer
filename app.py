@@ -67,7 +67,8 @@ FREE_FEATURES = [
 PRO_FEATURES = [
     "Everything in Free",
     "Download CSV reports",
-    "Save verified Pro access for the subscription period",
+    "Download formatted PDF analysis summaries",
+    "Save analysis summaries and view previous analysis history",
     "Priority access to future Pro tools",
 ]
 
@@ -136,6 +137,19 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS analysis_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id),
+                    filename TEXT NOT NULL,
+                    total_lines BIGINT NOT NULL,
+                    errors BIGINT NOT NULL,
+                    warnings BIGINT NOT NULL,
+                    info_other BIGINT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            db_execute(conn, kind, "CREATE INDEX IF NOT EXISTS idx_analysis_history_user_created ON analysis_history(user_id, created_at DESC)")
         else:
             db_execute(conn, kind, """
                 CREATE TABLE IF NOT EXISTS users (
@@ -180,6 +194,19 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+            db_execute(conn, kind, """
+                CREATE TABLE IF NOT EXISTS analysis_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    filename TEXT NOT NULL,
+                    total_lines INTEGER NOT NULL,
+                    errors INTEGER NOT NULL,
+                    warnings INTEGER NOT NULL,
+                    info_other INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            db_execute(conn, kind, "CREATE INDEX IF NOT EXISTS idx_analysis_history_user_created ON analysis_history(user_id, created_at DESC)")
         conn.commit()
     finally:
         conn.close()
@@ -289,6 +316,95 @@ def get_last_analysis():
     session.pop("last_analysis_id", None)
     return None
 
+def summarize_log_lines(lines):
+    """Return counts only; uploaded log contents are never saved to analysis history."""
+    errors = warnings = info_other = 0
+    for line in lines:
+        upper = line.upper()
+        if re.search(r"\b(ERROR|FATAL|CRITICAL|EXCEPTION)\b", upper):
+            errors += 1
+        elif re.search(r"\b(WARN|WARNING)\b", upper):
+            warnings += 1
+        else:
+            info_other += 1
+    return {"total": len(lines), "errors": errors, "warnings": warnings, "info_other": info_other}
+
+
+def save_analysis_history(user_id, filename, stats):
+    """Save a Pro user's report metadata and counts, never the raw uploaded log."""
+    conn, kind = db_connection()
+    try:
+        db_execute(conn, kind, """
+            INSERT INTO analysis_history(user_id, filename, total_lines, errors, warnings, info_other, created_at)
+            VALUES(?,?,?,?,?,?,?)
+        """, (user_id, filename[:255], stats["total"], stats["errors"], stats["warnings"],
+              stats["info_other"], iso(utc_now())))
+        # Keep the latest 100 summaries per account to limit database growth.
+        db_execute(conn, kind, """
+            DELETE FROM analysis_history
+            WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM analysis_history WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT 100
+            )
+        """, (user_id, user_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        app.logger.exception("Could not save analysis history for user_id=%s", user_id)
+        raise
+    finally:
+        conn.close()
+
+
+def make_pdf_report(filename, stats, created_at=None):
+    """Create a small, dependency-free PDF report with summary counts only."""
+    def pdf_text(value):
+        value = str(value).encode("latin-1", "replace").decode("latin-1")
+        return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    stamp = created_at or iso(utc_now())
+    lines = [
+        ("BT /F2 22 Tf 50 745 Td (Log Analyzer Pro) Tj ET",),
+        ("BT /F1 11 Tf 50 720 Td (Professional analysis summary) Tj ET",),
+        (f"BT /F2 13 Tf 50 675 Td ({pdf_text('File: ' + filename[:90])}) Tj ET",),
+        (f"BT /F1 10 Tf 50 652 Td ({pdf_text('Generated: ' + stamp[:40])}) Tj ET",),
+        ("0.12 0.22 0.38 rg 50 585 495 42 re f",),
+        ("1 1 1 rg BT /F2 12 Tf 68 600 Td (Analysis results) Tj ET",),
+        ("0.90 0.93 0.97 rg 50 515 495 54 re f",),
+        ("0.90 0.93 0.97 rg 50 445 495 54 re f",),
+        ("0.90 0.93 0.97 rg 50 375 495 54 re f",),
+        ("0.90 0.93 0.97 rg 50 305 495 54 re f",),
+        (f"0.08 0.12 0.20 rg BT /F1 11 Tf 68 545 Td ({pdf_text('Total lines: ' + stats['total'].__str__())}) Tj ET",),
+        (f"0.08 0.12 0.20 rg BT /F1 11 Tf 68 475 Td ({pdf_text('Errors: ' + stats['errors'].__str__())}) Tj ET",),
+        (f"0.08 0.12 0.20 rg BT /F1 11 Tf 68 405 Td ({pdf_text('Warnings: ' + stats['warnings'].__str__())}) Tj ET",),
+        (f"0.08 0.12 0.20 rg BT /F1 11 Tf 68 335 Td ({pdf_text('Info / other: ' + stats['info_other'].__str__())}) Tj ET",),
+        ("BT /F1 9 Tf 50 245 Td (This report contains summary counts only. Original log contents are not stored in history.) Tj ET",),
+        ("BT /F1 9 Tf 50 225 Td (Review the original application logs before making production changes.) Tj ET",),
+    ]
+    stream = "\n".join(item[0] for item in lines).encode("latin-1", "replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{number} 0 obj\n".encode())
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode())
+    pdf.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode())
+    return bytes(pdf)
+
+
 def send_reset_email(email, reset_url):
     """Send a password reset email through Brevo's transactional email API."""
     if not BREVO_API_KEY or not BREVO_SENDER_EMAIL:
@@ -345,7 +461,7 @@ li{margin:5px 0}.footer{text-align:center;color:var(--muted);font-size:12px;marg
 </style></head><body><div class="wrap">
 <header><div><h1>📊 Log Analyzer Pro</h1><div class="muted">Understand your application logs faster.</div></div>
 <nav class="nav"><a class="button secondary" href="/">Analyzer</a><a class="button secondary" href="/pricing">Pricing</a>
-{% if current_user %}<span class="badge">{{ current_user.email }}</span><a class="button secondary" href="/account">Account</a>
+{% if current_user %}<span class="badge">{{ current_user.email }}</span>{% if is_pro %}<a class="button secondary" href="/history">History</a>{% endif %}<a class="button secondary" href="/account">Account</a>
 <form method="post" action="/logout" style="margin:0"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">Log out</button></form>
 {% else %}<a class="button secondary" href="/login">Log in</a><a class="button" href="/register">Create account</a>{% endif %}
 </nav></header>
@@ -369,7 +485,7 @@ HOME_CONTENT = r"""
 {% for item in logs %}<div class="log {{ item.kind }}">{{ item.text }}</div>{% else %}<p class="muted">No matching lines.</p>{% endfor %}
 {% if advice %}<section class="panel"><h2>Automatic explanations and suggested fixes</h2><p class="muted">These are general troubleshooting suggestions based on matching text in your logs. Confirm the cause before changing a production system.</p>
 {% for item in advice %}<div class="card" style="margin:10px 0"><strong>{{ item.title }}</strong><p>{{ item.explanation }}</p><strong>Suggested checks</strong><ul>{% for step in item.steps %}<li>{{ step }}</li>{% endfor %}</ul><p class="muted">Matched log: {{ item.line }}</p></div>{% endfor %}</section>{% endif %}
-{% if is_pro %}<a class="button green" href="/report.csv">Download CSV report</a>{% else %}<p class="muted">CSV export is a Pro feature. <a href="/pricing">Upgrade to Pro</a>.</p>{% endif %}
+{% if is_pro %}<div class="row"><a class="button green" href="/report.csv">Download CSV report</a><a class="button secondary" href="/report.pdf">Download PDF summary</a><a class="button secondary" href="/history">Analysis history</a></div>{% else %}<p class="muted">CSV and PDF reports, plus saved analysis history, are Pro features. <a href="/pricing">Upgrade to Pro</a>.</p>{% endif %}
 </section>{% endif %}
 """
 
@@ -398,7 +514,19 @@ def home():
                     session.pop("last_upload_lines", None)
                     session.pop("last_upload_name", None)
                     session["last_analysis_id"] = analysis_id
-                    flash(f"Loaded {len(raw_lines)} lines from {filename}.", "success")
+                    user_id = session.get("user_id")
+                    history_saved = False
+                    if user_id and active_pro(user_id):
+                        try:
+                            save_analysis_history(user_id, filename, summarize_log_lines(raw_lines))
+                            history_saved = True
+                        except Exception:
+                            # Analysis itself remains available even if the history write fails.
+                            flash("Your analysis is ready, but we could not save it to history.", "error")
+                    success_message = f"Loaded {len(raw_lines)} lines from {filename}."
+                    if history_saved:
+                        success_message += " Summary saved to your Pro history."
+                    flash(success_message, "success")
                     return redirect(url_for("home"))
     analysis = get_last_analysis()
     raw_lines = analysis["lines"] if analysis else None
@@ -619,11 +747,12 @@ def logout():
 @app.route("/pricing")
 def pricing():
     content = r"""
-<section class="panel"><h2>Choose your plan</h2><p class="muted">Start free, or upgrade to unlock CSV export. Pro access lasts for the purchased period.</p>
+<section class="panel"><h2>Choose your plan</h2><p class="muted">Start free, or upgrade for CSV exports, PDF analysis summaries, and saved analysis summaries. Pro access lasts for the purchased period.</p>
 <div class="grid"><article class="card"><h3>Free</h3><div class="price">₦0</div><ul>{% for feature in free_features %}<li>{{ feature }}</li>{% endfor %}</ul><a class="button secondary" href="/">Use Free</a></article>
 {% for key,plan in plans.items() %}<article class="card"><span class="badge">PRO</span><h3 style="margin-top:10px">{{ plan.name }}</h3><div class="price">{{ plan.display }}</div><ul>{% for feature in pro_features %}<li>{{ feature }}</li>{% endfor %}</ul>
 {% if current_user %}<form method="post" action="/checkout/{{ key }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="green" type="submit">Upgrade to {{ plan.name }}</button></form>{% else %}<a class="button green" href="/register">Create account to upgrade</a>{% endif %}
 </article>{% endfor %}</div>
+<p class="muted">Yearly Pro costs ₦150,000 instead of ₦180,000 when paid monthly for 12 months — save ₦30,000 per year.</p>
 <p class="muted">Payments are processed by Paystack. By choosing a Pro plan, you authorize recurring charges of the displayed amount at the displayed interval until you cancel. Pro access is granted only after server-side payment verification. If you cancel, access remains active until the paid period ends.</p></section>
 """
     return render_template_string(base_template(content), title="Pricing")
@@ -1108,6 +1237,53 @@ def download_report():
     data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
     return send_file(data, mimetype="text/csv", as_attachment=True,
                      download_name=f"log-analysis-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv")
+
+@app.route("/report.pdf")
+@login_required
+def download_pdf_report():
+    user_id = session.get("user_id")
+    if not active_pro(user_id):
+        flash("PDF reports are available on Pro. Choose a plan to unlock them.", "error")
+        return redirect(url_for("pricing"))
+    analysis = get_last_analysis()
+    if not analysis:
+        flash("Upload a log file before downloading a PDF report. The active analysis expires after 30 minutes or a server restart.", "error")
+        return redirect(url_for("home"))
+    stats = summarize_log_lines(analysis["lines"])
+    pdf_data = make_pdf_report(analysis["filename"], stats)
+    output = io.BytesIO(pdf_data)
+    output.seek(0)
+    return send_file(output, mimetype="application/pdf", as_attachment=True,
+                     download_name=f"log-analysis-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf")
+
+
+@app.route("/history")
+@login_required
+def analysis_history():
+    user_id = session.get("user_id")
+    if not active_pro(user_id):
+        flash("Saved analysis history is available on Pro. Choose a plan to unlock it.", "error")
+        return redirect(url_for("pricing"))
+    conn, kind = db_connection()
+    try:
+        rows = db_execute(conn, kind, """
+            SELECT filename, total_lines, errors, warnings, info_other, created_at
+            FROM analysis_history WHERE user_id = ?
+            ORDER BY created_at DESC, id DESC LIMIT 100
+        """, (user_id,)).fetchall()
+        history = [dict(row) for row in rows]
+    finally:
+        conn.close()
+    content = r"""
+<section class="panel"><h2>Your analysis history</h2>
+<p class="muted">Your latest 100 Pro analysis summaries are saved here. For privacy, original uploaded log contents are not stored in history.</p>
+{% if history %}<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;text-align:left"><thead><tr><th>File</th><th>Date</th><th>Total</th><th>Errors</th><th>Warnings</th><th>Info / other</th></tr></thead><tbody>
+{% for item in history %}<tr><td style="padding:10px;border-top:1px solid #293653">{{ item.filename }}</td><td style="padding:10px;border-top:1px solid #293653">{{ item.created_at }}</td><td style="padding:10px;border-top:1px solid #293653">{{ item.total_lines }}</td><td style="padding:10px;border-top:1px solid #293653">{{ item.errors }}</td><td style="padding:10px;border-top:1px solid #293653">{{ item.warnings }}</td><td style="padding:10px;border-top:1px solid #293653">{{ item.info_other }}</td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="muted">No saved analysis summaries yet. Upload a log file while your Pro plan is active to start your history.</p>{% endif %}
+<p><a class="button secondary" href="/">Back to Analyzer</a></p></section>
+"""
+    return render_template_string(base_template(content), title="Analysis history", history=history)
+
 
 @app.route("/health")
 def health():
